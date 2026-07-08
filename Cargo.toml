@@ -2,7 +2,8 @@
 name = "probedb"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "AI内建数据库 — 从第一天就将AI作为一等公民的原生数据库"
 
 [dependencies]
+# 不依赖外部SQL解析器，ProbeDB自研精简SQL解析
+# 后续可根据需求引入 sqlparser-rs
