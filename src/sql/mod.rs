@@ -266,9 +266,17 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         remaining = cond;
     }
 
-    // ORDER BY
+    // ORDER BY — 先检查是否以 ORDER BY 开头
     let upper2 = remaining.to_uppercase();
-    if let Some(pos) = upper2.find(" ORDER BY ") {
+    if upper2.starts_with("ORDER BY ") {
+        let order_rest = remaining[9..].trim().to_string();
+        let end = order_rest.to_uppercase().find(" LIMIT").unwrap_or(order_rest.len());
+        order_by = Some(order_rest[..end].trim().to_string());
+        // 更新remaining用于后续LIMIT解析
+        if end < order_rest.len() {
+            remaining = order_rest[end..].to_string();
+        }
+    } else if let Some(pos) = upper2.find(" ORDER BY ") {
         let order_rest = remaining[pos + 10..].trim().to_string();
         let end = order_rest.to_uppercase().find(" LIMIT").unwrap_or(order_rest.len());
         order_by = Some(order_rest[..end].trim().to_string());
