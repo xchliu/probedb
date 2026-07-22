@@ -9,6 +9,8 @@ use crate::types::Value;
 pub enum ExecuteResult {
     TableCreated { name: String },
     Inserted { row_id: u64 },
+    Deleted { count: usize },
+    Updated { count: usize },
     SelectResult {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,

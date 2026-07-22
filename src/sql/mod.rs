@@ -22,6 +22,15 @@ pub enum SQLStatement {
         order_by: Option<String>,
         limit: Option<u64>,
     },
+    Delete {
+        table_name: String,
+        where_clause: Option<String>,
+    },
+    Update {
+        table_name: String,
+        assignments: Vec<(String, String)>, // (column_name, new_value_expr)
+        where_clause: Option<String>,
+    },
 }
 
 /// 列定义
@@ -61,6 +70,10 @@ fn parse_one(sql: &str) -> Result<SQLStatement, String> {
         parse_insert(sql)
     } else if upper.starts_with("SELECT") {
         parse_select(sql)
+    } else if upper.starts_with("DELETE FROM") {
+        parse_delete(sql)
+    } else if upper.starts_with("UPDATE ") {
+        parse_update(sql)
     } else {
         Err(format!("不支持的SQL语句: {}", sql))
     }
@@ -311,6 +324,98 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     })
 }
 
+/// 解析 DELETE 语句
+/// DELETE FROM table WHERE condition
+fn parse_delete(sql: &str) -> Result<SQLStatement, String> {
+    let s = sql.trim();
+    let rest = s.strip_prefix("DELETE FROM")
+        .or_else(|| s.strip_prefix("delete from"))
+        .ok_or_else(|| "无法解析DELETE FROM".to_string())?
+        .trim();
+
+    // 提取表名
+    let (table_name, rest) = split_first_word(rest)?;
+
+    let mut where_clause = None;
+    let remaining = rest.trim().to_string();
+    let upper = remaining.to_uppercase();
+
+    if upper.starts_with("WHERE ") || upper.starts_with("WHERE\n") {
+        let cond = remaining[6..].trim().to_string();
+        where_clause = Some(cond);
+    } else if let Some(pos) = upper.find(" WHERE ") {
+        let cond = remaining[pos + 7..].trim().to_string();
+        where_clause = Some(cond);
+    } else if !remaining.is_empty() {
+        return Err(format!("DELETE语法错误: {}", sql));
+    }
+
+    Ok(SQLStatement::Delete {
+        table_name: table_name.to_lowercase(),
+        where_clause,
+    })
+}
+
+/// 解析 UPDATE 语句
+/// UPDATE table SET col1=val1, col2=val2 WHERE condition
+fn parse_update(sql: &str) -> Result<SQLStatement, String> {
+    let s = sql.trim();
+    let rest = s.strip_prefix("UPDATE")
+        .or_else(|| s.strip_prefix("update"))
+        .ok_or_else(|| "无法解析UPDATE".to_string())?
+        .trim();
+
+    // 提取表名
+    let (table_name, rest) = split_first_word(rest)?;
+    let rest = rest.trim();
+
+    // 检查 SET
+    let upper_rest = rest.to_uppercase();
+    if !upper_rest.starts_with("SET ") {
+        return Err("UPDATE缺少SET子句".to_string());
+    }
+    let after_set = rest[4..].trim().to_string(); // 去掉 "SET "
+
+    // 解析赋值列表到 WHERE 或结尾
+    let upper_after_set = after_set.to_uppercase();
+    let where_pos = upper_after_set.find(" WHERE ");
+    let assign_part = if let Some(pos) = where_pos {
+        after_set[..pos].trim().to_string()
+    } else {
+        after_set.trim().to_string()
+    };
+
+    // 解析 "col1=val1, col2=val2"
+    let mut assignments = Vec::new();
+    for part in assign_part.split(',') {
+        let part = part.trim();
+        if let Some(eq_pos) = part.find('=') {
+            let col = part[..eq_pos].trim().to_lowercase();
+            let val = part[eq_pos + 1..].trim().to_string();
+            assignments.push((col, val));
+        } else {
+            return Err(format!("UPDATE赋值语法错误: {}", part));
+        }
+    }
+
+    if assignments.is_empty() {
+        return Err("UPDATE至少需要一个赋值".to_string());
+    }
+
+    // 提取 WHERE
+    let mut where_clause = None;
+    if let Some(pos) = where_pos {
+        let cond = after_set[pos + 7..].trim().to_string();
+        where_clause = Some(cond);
+    }
+
+    Ok(SQLStatement::Update {
+        table_name: table_name.to_lowercase(),
+        assignments,
+        where_clause,
+    })
+}
+
 // ========== 辅助函数 ==========
 
 /// 分割第一个单词和剩余部分
@@ -490,6 +595,58 @@ mod tests {
                 assert_eq!(values[0][1], "'[0.1,0.2,0.3]'");
             }
             _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete() {
+        let stmts = parse_sql("DELETE FROM users WHERE id = 1").unwrap();
+        match &stmts[0] {
+            SQLStatement::Delete { table_name, where_clause } => {
+                assert_eq!(table_name, "users");
+                assert!(where_clause.is_some());
+                assert!(where_clause.as_ref().unwrap().contains("id = 1"));
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_all() {
+        let stmts = parse_sql("DELETE FROM users").unwrap();
+        match &stmts[0] {
+            SQLStatement::Delete { table_name, where_clause } => {
+                assert_eq!(table_name, "users");
+                assert!(where_clause.is_none());
+            }
+            _ => panic!("Expected Delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update() {
+        let stmts = parse_sql("UPDATE users SET name = 'bob' WHERE id = 1").unwrap();
+        match &stmts[0] {
+            SQLStatement::Update { table_name, assignments, where_clause } => {
+                assert_eq!(table_name, "users");
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].0, "name");
+                assert!(where_clause.is_some());
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_multi_assign() {
+        let stmts = parse_sql("UPDATE users SET name = 'bob', age = 30 WHERE id = 1").unwrap();
+        match &stmts[0] {
+            SQLStatement::Update { assignments, .. } => {
+                assert_eq!(assignments.len(), 2);
+                assert_eq!(assignments[0].0, "name");
+                assert_eq!(assignments[1].0, "age");
+            }
+            _ => panic!("Expected Update"),
         }
     }
 }

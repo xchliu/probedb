@@ -109,6 +109,50 @@ impl StorageEngine {
     pub fn table_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }
+
+    /// 按ID列表删除行
+    pub fn delete_by_ids(&mut self, table_name: &str, ids: &[u64]) -> Result<usize, String> {
+        let table_name_str = table_name.to_string();
+        let rows = self.data.get_mut(&table_name_str)
+            .ok_or_else(|| format!("表 '{}' 不存在", table_name))?;
+
+        let original_len = rows.len();
+        let id_set: std::collections::HashSet<u64> = ids.iter().cloned().collect();
+        rows.retain(|r| !id_set.contains(&r.id));
+        let deleted = original_len - rows.len();
+        Ok(deleted)
+    }
+
+    /// 更新指定ID行的指定列
+    pub fn update_by_ids(
+        &mut self,
+        table_name: &str,
+        ids: &[u64],
+        col_index: usize,
+        new_value: Value,
+    ) -> Result<usize, String> {
+        let table_name_str = table_name.to_string();
+        let rows = self.data.get_mut(&table_name_str)
+            .ok_or_else(|| format!("表 '{}' 不存在", table_name))?;
+
+        let id_set: std::collections::HashSet<u64> = ids.iter().cloned().collect();
+        let mut updated = 0;
+        for row in rows.iter_mut() {
+            if id_set.contains(&row.id) {
+                if col_index < row.values.len() {
+                    row.values[col_index] = new_value.clone();
+                    updated += 1;
+                }
+            }
+        }
+        Ok(updated)
+    }
+
+    /// 获取某个表的可变引用数据（用于事务性替换）
+    pub fn table_data_mut(&mut self, table_name: &str) -> Result<&mut Vec<Row>, String> {
+        self.data.get_mut(table_name)
+            .ok_or_else(|| format!("表 '{}' 不存在", table_name))
+    }
 }
 
 /// 检查值是否匹配列类型
