@@ -36,6 +36,12 @@ impl ProbeDB {
                 executor::ExecuteResult::Inserted { row_id } => {
                     output.push(format!("插入成功，行ID: {}", row_id));
                 }
+                executor::ExecuteResult::Deleted { count } => {
+                    output.push(format!("删除成功，共 {} 行", count));
+                }
+                executor::ExecuteResult::Updated { count } => {
+                    output.push(format!("更新成功，共 {} 行", count));
+                }
                 executor::ExecuteResult::SelectResult { columns, rows } => {
                     // 格式化输出
                     let header = columns.join(" | ");

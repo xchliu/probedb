@@ -435,7 +435,7 @@ fn split_parenthesized(s: &str) -> Result<(String, String), String> {
         return Err("期望左括号".to_string());
     }
     let mut depth = 0;
-    let mut content_start = 1;
+    let content_start = 1;
     let mut content_end = 0;
     let mut found = false;
 

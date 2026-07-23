@@ -78,6 +78,50 @@ impl Executor {
                 Ok(ExecuteResult::Message(format!("插入 {} 行数据", count)))
             }
 
+            SQLStatement::Delete { table_name, where_clause } => {
+                let schema = self.engine.get_schema(&table_name)?;
+                let rows = self.engine.scan_table(&table_name)?.clone();
+
+                let matched = if let Some(ref condition) = where_clause {
+                    filter_rows(&rows, condition, &schema)?
+                } else {
+                    rows
+                };
+
+                let ids: Vec<u64> = matched.iter().map(|r| r.id).collect();
+                let count = self.engine.delete_by_ids(&table_name, &ids)?;
+                Ok(ExecuteResult::Deleted { count })
+            }
+
+            SQLStatement::Update { table_name, assignments, where_clause } => {
+                let schema = self.engine.get_schema(&table_name)?;
+                let rows = self.engine.scan_table(&table_name)?.clone();
+
+                let matched = if let Some(ref condition) = where_clause {
+                    filter_rows(&rows, condition, &schema)?
+                } else {
+                    rows
+                };
+
+                let ids: Vec<u64> = matched.iter().map(|r| r.id).collect();
+                let mut total_updated = 0;
+
+                for (col_name, val_str) in &assignments {
+                    let ci = schema.columns.iter()
+                        .find(|c| c.name == *col_name)
+                        .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+                    let value = parse_value(val_str, &ci.data_type)
+                        .map_err(|e| format!("解析更新值 '{}' 失败: {}", val_str, e))?;
+                    let count = self.engine.update_by_ids(&table_name, &ids, ci.index, value)?;
+                    total_updated += count;
+                }
+
+                let col_count = assignments.len();
+                Ok(ExecuteResult::Updated {
+                    count: total_updated / col_count.max(1),
+                })
+            }
+
             SQLStatement::Select { table_name, columns: _, where_clause, order_by, limit } => {
                 let schema = self.engine.get_schema(&table_name)?;
                 let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();

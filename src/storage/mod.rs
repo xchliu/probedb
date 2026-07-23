@@ -72,7 +72,7 @@ impl StorageEngine {
         }
 
         // 类型校验
-        for (i, (col, val)) in schema.columns.iter().zip(values.iter()).enumerate() {
+        for (_, (col, val)) in schema.columns.iter().zip(values.iter()).enumerate() {
             if !type_matches(&col.data_type, val) {
                 return Err(format!(
                     "列 '{}' 类型不匹配: 期望 {:?}, 得到 {:?}",
