@@ -94,7 +94,7 @@ impl Executor {
             }
 
             SQLStatement::Update { table_name, assignments, where_clause } => {
-                let schema = self.engine.get_schema(&table_name)?;
+                let schema = self.engine.get_schema(&table_name)?.clone();
                 let rows = self.engine.scan_table(&table_name)?.clone();
 
                 let matched = if let Some(ref condition) = where_clause {
@@ -107,12 +107,12 @@ impl Executor {
                 let mut total_updated = 0;
 
                 for (col_name, val_str) in &assignments {
-                    let ci = schema.columns.iter()
+                    let col = schema.columns.iter()
                         .find(|c| c.name == *col_name)
                         .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
-                    let value = parse_value(val_str, &ci.data_type)
+                    let value = parse_value(val_str, &col.data_type)
                         .map_err(|e| format!("解析更新值 '{}' 失败: {}", val_str, e))?;
-                    let count = self.engine.update_by_ids(&table_name, &ids, ci.index, value)?;
+                    let count = self.engine.update_by_ids(&table_name, &ids, col.index, value)?;
                     total_updated += count;
                 }
 
@@ -593,6 +593,112 @@ mod tests {
             ExecuteResult::SelectResult { rows, .. } => {
                 assert_eq!(rows.len(), 3);
                 assert_eq!(rows[0][0], "3"); // DESC 排序
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_delete_with_where() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'bob')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (3, 'charlie')").unwrap()).unwrap();
+
+        // DELETE WHERE
+        let results = executor.execute(parse_sql("DELETE FROM t WHERE id = 1").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::Deleted { count } => assert_eq!(*count, 1),
+            _ => panic!("Expected Deleted"),
+        }
+
+        // 验证剩余行
+        let results = executor.execute(parse_sql("SELECT id FROM t ORDER BY id ASC").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], "2");
+                assert_eq!(rows[1][0], "3");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_delete_all() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id) VALUES (1)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id) VALUES (2)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("DELETE FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::Deleted { count } => assert_eq!(*count, 2),
+            _ => panic!("Expected Deleted"),
+        }
+
+        let results = executor.execute(parse_sql("SELECT id FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows.len(), 0),
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_update_with_where() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (2, 'bob', 25)").unwrap()).unwrap();
+
+        // UPDATE WHERE
+        let results = executor.execute(parse_sql("UPDATE t SET name = 'alice_updated', age = 31 WHERE id = 1").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::Updated { count } => assert_eq!(*count, 1),
+            _ => panic!("Expected Updated"),
+        }
+
+        // 验证更新
+        let results = executor.execute(parse_sql("SELECT id, name, age FROM t WHERE id = 1").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][1], "alice_updated");
+                assert_eq!(rows[0][2], "31");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // 验证未被影响的行不变
+        let results = executor.execute(parse_sql("SELECT id, name FROM t WHERE id = 2").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][1], "bob");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_update_all() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'bob')").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("UPDATE t SET name = 'updated'").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::Updated { count } => assert_eq!(*count, 2),
+            _ => panic!("Expected Updated"),
+        }
+
+        // SELECT * FROM t 返回所有列，name 是第2列(index=1)
+        let results = executor.execute(parse_sql("SELECT * FROM t ORDER BY id ASC").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][1], "updated");
+                assert_eq!(rows[1][1], "updated");
             }
             _ => panic!("Expected SelectResult"),
         }
