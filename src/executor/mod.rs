@@ -3,6 +3,7 @@
 use crate::sql::SQLStatement;
 use crate::storage::*;
 use crate::types::Value;
+use crate::types::cosine_similarity;
 
 /// 执行结果
 #[derive(Debug)]
@@ -126,21 +127,50 @@ impl Executor {
                 let schema = self.engine.get_schema(&table_name)?;
                 let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
-                // 扫描全表 — 需要clone为owned vec，因为filter_rows和sort_rows需要修改
+                // 扫描全表
                 let rows = self.engine.scan_table(&table_name)?.clone();
 
-                // WHERE 过滤
-                let mut matched = rows;
+                // 检查是否需要计算向量相似度（用于 ORDER BY）
+                let vector_sim_order = parse_order_by_vector_call(order_by.as_deref());
+
+                // 预先计算 vector_similarity 得分（如果 ORDER BY 需要）
+                let mut scored_rows: Vec<(Row, Option<f64>)> = if let Some(ref vs) = vector_sim_order {
+                    rows.into_iter().map(|row| {
+                        let score = compute_vector_similarity(&row, &vs.col_name, &vs.target, &schema);
+                        (row, score)
+                    }).collect()
+                } else {
+                    rows.into_iter().map(|r| (r, None)).collect()
+                };
+
+                // WHERE 过滤（对带有 vector_similarity 调用的条件做原生求值）
                 if let Some(ref condition) = where_clause {
-                    matched = filter_rows(&matched, condition, &schema)?;
+                    scored_rows = filter_rows_with_scores(scored_rows, condition, &schema)?;
                 }
+
+                // 提取原始行（过滤后的）
+                let mut matched: Vec<Row> = scored_rows.iter().map(|(r, _)| r.clone()).collect();
 
                 // 构建列名索引
                 let col_indices: Vec<usize> = schema.columns.iter().map(|c| c.index).collect();
 
                 // ORDER BY
-                let mut sorted = if let Some(ref order_by_str) = order_by {
-                    sort_rows(&matched, order_by_str, &schema)?
+                let mut sorted: Vec<Row> = if let Some(ref order_by_str) = order_by {
+                    let (order_col, descending) = parse_order_by_str(order_by_str);
+
+                    // 检查是否是 vector_similarity 排序
+                    if let Some(ref vs) = vector_sim_order {
+                        // 用预先计算的相似度排序
+                        scored_rows.sort_by(|a, b| {
+                            let sa = a.1.unwrap_or(0.0);
+                            let sb = b.1.unwrap_or(0.0);
+                            if descending { sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) }
+                            else { sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal) }
+                        });
+                        scored_rows.iter().map(|(r, _)| r.clone()).collect()
+                    } else {
+                        sort_rows(&matched, &order_col, descending, &schema)?
+                    }
                 } else {
                     matched
                 };
@@ -170,6 +200,124 @@ impl Executor {
                 })
             }
         }
+    }
+}
+
+// ===== 向量相似度原生函数支持 =====
+
+/// 解析 vector_similarity(col, target) 函数调用字符串
+struct VectorSimilarityCall {
+    col_name: String,
+    target: Vec<f64>,
+}
+
+/// 尝试解析 "vector_similarity(embedding, '[0.1,0.2,0.3]')" 格式
+fn parse_vector_similarity_call(text: &str) -> Option<VectorSimilarityCall> {
+    let text = text.trim();
+    let upper = text.to_uppercase();
+
+    // 必须以 vector_similarity( 开头
+    if !upper.starts_with("VECTOR_SIMILARITY(") {
+        return None;
+    }
+
+    // 提取括号内的内容
+    let args_start = text.find('(')? + 1;
+    let rest = &text[args_start..];
+    let mut depth = 0;
+    let mut args_end = 0;
+    for (i, c) in rest.char_indices() {
+        if c == '(' { depth += 1; }
+        else if c == ')' {
+            if depth == 0 { args_end = i; break; }
+            else { depth -= 1; }
+        }
+    }
+    if args_end == 0 { return None; }
+
+    let args_str = rest[..args_end].trim();
+
+    // 按逗号分割参数（不在括号/方括号/引号内的逗号）
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut depth_paren = 0;
+    let mut depth_bracket = 0;
+    let mut in_quote = false;
+    for c in args_str.chars() {
+        match c {
+            '(' => { depth_paren += 1; current.push(c); }
+            ')' if depth_paren > 0 => { depth_paren -= 1; current.push(c); }
+            '[' => { depth_bracket += 1; current.push(c); }
+            ']' if depth_bracket > 0 => { depth_bracket -= 1; current.push(c); }
+            '\'' => { in_quote = !in_quote; current.push(c); }
+            ',' if depth_paren == 0 && depth_bracket == 0 && !in_quote => {
+                args.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        args.push(current.trim().to_string());
+    }
+
+    if args.len() != 2 {
+        return None;
+    }
+
+    let col_name = args[0].trim().to_lowercase();
+    let target_str = args[1].trim().trim_matches('\'');
+
+    // 解析向量 [1.0,2.0,3.0]
+    let trimmed = target_str.trim_matches('[').trim_matches(']');
+    let nums: Result<Vec<f64>, _> = trimmed.split(',')
+        .map(|s| s.trim().parse::<f64>())
+        .collect();
+    let target = nums.ok()?;
+
+    if target.is_empty() {
+        return None;
+    }
+
+    Some(VectorSimilarityCall { col_name, target })
+}
+
+/// 计算某行的向量相似度（如果该列存在且是向量类型）
+fn compute_vector_similarity(row: &Row, col_name: &str, target: &[f64], schema: &TableSchema) -> Option<f64> {
+    let ci = schema.columns.iter().find(|c| c.name == col_name)?;
+    let val = row.values.get(ci.index)?;
+    match val {
+        Value::Vector(v) => Some(cosine_similarity(v, target)),
+        _ => None,
+    }
+}
+
+/// 解析 ORDER BY 中的 vector_similarity 调用
+fn parse_order_by_vector_call(order_by: Option<&str>) -> Option<VectorSimilarityCall> {
+    let text = order_by?;
+    let text = text.trim();
+    // 去掉末尾的 ASC/DESC
+    let upper = text.to_uppercase();
+    let func_text = if upper.ends_with(" DESC") {
+        &text[..text.len() - 5]
+    } else if upper.ends_with(" ASC") {
+        &text[..text.len() - 4]
+    } else {
+        text
+    };
+    parse_vector_similarity_call(func_text)
+}
+
+/// 解析 ORDER BY 字符串为 (列名, 是否降序)
+fn parse_order_by_str(order_by: &str) -> (String, bool) {
+    let order_by = order_by.trim();
+    let upper = order_by.to_uppercase();
+    if let Some(pos) = upper.rfind(" DESC") {
+        (order_by[..pos].trim().to_string(), true)
+    } else if let Some(pos) = upper.rfind(" ASC") {
+        (order_by[..pos].trim().to_string(), false)
+    } else {
+        (order_by.to_string(), false)
     }
 }
 
@@ -218,9 +366,15 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-/// 求值单个条件（如 "age > 30"）
+/// 求值单个条件（支持普通列比较 + vector_similarity 原生函数）
 fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bool, String> {
     let c = condition.trim();
+
+    // 检查是否是 vector_similarity() 条件
+    let upper_c = c.to_uppercase();
+    if upper_c.starts_with("VECTOR_SIMILARITY(") {
+        return eval_vector_similarity_condition(c, row, schema);
+    }
 
     // 处理 LIKE 操作
     if let Some(pos) = c.to_uppercase().find(" LIKE ") {
@@ -243,7 +397,7 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
 
     for op in &ops {
         if let Some(pos) = c.find(op) {
-            // 确保不是单词中间（比如"name"里的"="不会有）
+            // 确保不是单词中间（比如"name"里的"= "不会有）
             if pos > 0 {
                 let before = c.chars().nth(pos - 1).unwrap_or(' ');
                 if before.is_alphanumeric() || before == '_' || before == '`' {
@@ -288,6 +442,100 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
     };
 
     Ok(result)
+}
+
+/// 求值 vector_similarity() 条件（原生函数调用）
+/// 语法: vector_similarity(col_name, '[1.0,2.0,3.0]') > 0.8
+fn eval_vector_similarity_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bool, String> {
+    let c = condition.trim();
+
+    // 找到操作符位置（在函数的右括号之后）
+    let ops = [">=", "<=", "!=", "=", ">", "<"];
+    // 先找到右括号的位置
+    let func_end = {
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, ch) in c.char_indices() {
+            if ch == '(' { depth += 1; }
+            else if ch == ')' {
+                depth -= 1;
+                if depth == 0 { end = i + 1; break; }
+            }
+        }
+        if end == 0 { return Err(format!("函数调用括号不匹配: {}", c)); }
+        end
+    };
+
+    let func_call = &c[..func_end];
+    let rest = c[func_end..].trim();
+
+    let vs = parse_vector_similarity_call(func_call)
+        .ok_or_else(|| format!("无法解析 vector_similarity 调用: {}", func_call))?;
+
+    // 计算相似度
+    let sim = compute_vector_similarity(row, &vs.col_name, &vs.target, schema)
+        .ok_or_else(|| format!("列 '{}' 不是 VECTOR 类型或不存在", vs.col_name))?;
+
+    // 解析操作符和阈值
+    let mut found_op = "";
+    let mut op_start = None;
+    for op in &ops {
+        if let Some(pos) = rest.find(op) {
+            op_start = Some(pos);
+            found_op = op;
+            break;
+        }
+    }
+
+    let pos = op_start.ok_or_else(|| format!("vector_similarity 条件缺少比较操作符: {}", c))?;
+    let threshold_str = rest[pos + found_op.len()..].trim();
+    let threshold: f64 = threshold_str.parse::<f64>()
+        .map_err(|_| format!("无法解析相似度阈值: {}", threshold_str))?;
+
+    let result = match found_op {
+        ">"  => sim > threshold,
+        ">=" => sim >= threshold,
+        "<"  => sim < threshold,
+        "<=" => sim <= threshold,
+        "="  => (sim - threshold).abs() < 1e-10,
+        "!=" => (sim - threshold).abs() >= 1e-10,
+        _ => return Err(format!("不支持的操作符: {}", found_op)),
+    };
+
+    Ok(result)
+}
+
+/// 带得分的行过滤（支持 vector_similarity 原生函数）
+fn filter_rows_with_scores(
+    rows: Vec<(Row, Option<f64>)>,
+    where_clause: &str,
+    schema: &TableSchema,
+) -> Result<Vec<(Row, Option<f64>)>, String> {
+    // 按 OR 分割
+    let or_parts: Vec<&str> = split_top_level(where_clause, " OR ");
+
+    let mut all_matched = Vec::new();
+    for or_part in &or_parts {
+        // 按 AND 分割
+        let and_parts: Vec<&str> = split_top_level(or_part, " AND ");
+
+        let mut or_matched = Vec::new();
+        for (row, score) in &rows {
+            let all_true = and_parts.iter().all(|cond| {
+                eval_condition(cond, row, schema).unwrap_or(false)
+            });
+            if all_true {
+                or_matched.push((row.clone(), *score));
+            }
+        }
+        all_matched.extend(or_matched);
+    }
+
+    // 去重
+    all_matched.sort_by_key(|(r, _)| r.id);
+    all_matched.dedup_by_key(|(r, _)| r.id);
+
+    Ok(all_matched)
 }
 
 /// 简单 LIKE 模式匹配（不含外部正则库）
@@ -444,26 +692,15 @@ fn split_top_level<'a>(s: &'a str, delimiter: &str) -> Vec<&'a str> {
 
 fn sort_rows(
     rows: &[Row],
-    order_by_str: &str,
+    order_col: &str,
+    descending: bool,
     schema: &TableSchema,
 ) -> Result<Vec<Row>, String> {
     let mut sorted = rows.to_vec();
 
-    // 解析 "col ASC" 或 "col DESC"
-    let order_by_str = order_by_str.trim();
-    let (col_name, descending) = if let Some(pos) = order_by_str.to_uppercase().rfind(" DESC") {
-        let col = order_by_str[..pos].trim();
-        (col.to_string(), true)
-    } else if let Some(pos) = order_by_str.to_uppercase().rfind(" ASC") {
-        let col = order_by_str[..pos].trim();
-        (col.to_string(), false)
-    } else {
-        (order_by_str.to_string(), false)
-    };
-
     // 获取列索引
-    let ci = schema.columns.iter().find(|c| c.name == col_name)
-        .ok_or_else(|| format!("排序列 '{}' 不存在", col_name))?;
+    let ci = schema.columns.iter().find(|c| c.name == *order_col)
+        .ok_or_else(|| format!("排序列 '{}' 不存在", order_col))?;
     let col_idx = ci.index;
 
     sorted.sort_by(|a, b| {
@@ -481,7 +718,7 @@ fn sort_rows(
     Ok(sorted)
 }
 
-// ===== 允许 cargo build 通过 =====
+// ===== 测试 =====
 
 #[cfg(test)]
 mod tests {
@@ -702,5 +939,173 @@ mod tests {
             }
             _ => panic!("Expected SelectResult"),
         }
+    }
+
+    // ===== 向量相似度测试 =====
+
+    fn setup_vector_table(executor: &mut Executor) {
+        executor.execute(parse_sql(
+            "CREATE TABLE items (id INTEGER, name TEXT, embedding VECTOR(3))"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO items (id, name, embedding) VALUES (1, 'apple', '[1.0,0.0,0.0]')"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO items (id, name, embedding) VALUES (2, 'banana', '[0.0,1.0,0.0]')"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO items (id, name, embedding) VALUES (3, 'cherry', '[0.0,0.0,1.0]')"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO items (id, name, embedding) VALUES (4, 'date', '[0.9,0.1,0.0]')"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO items (id, name, embedding) VALUES (5, 'elderberry', '[0.5,0.5,0.0]')"
+        ).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_vector_similarity_where_filter() {
+        let mut executor = Executor::new();
+        setup_vector_table(&mut executor);
+
+        // 查询与 [1.0, 0.0, 0.0] 相似度 > 0.9 的行
+        let results = executor.execute(parse_sql(
+            "SELECT id, name FROM items WHERE vector_similarity(embedding, '[1.0,0.0,0.0]') > 0.9"
+        ).unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // apple (相似度1.0) 和 date (相似度0.993) 应匹配
+                assert_eq!(rows.len(), 2, "应与 [1,0,0] 相似度 > 0.9 的有 2 条（apple, date）");
+                assert_eq!(rows[0][1], "apple");
+                assert_eq!(rows[1][1], "date");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_vector_similarity_order_by() {
+        let mut executor = Executor::new();
+        setup_vector_table(&mut executor);
+
+        // 按与 [1.0, 0.0, 0.0] 的相似度降序排列
+        let results = executor.execute(parse_sql(
+            "SELECT id, name FROM items ORDER BY vector_similarity(embedding, '[1.0,0.0,0.0]') DESC"
+        ).unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 5);
+                // 第一个应该是 apple（最相似于 [1,0,0]）
+                assert_eq!(rows[0][1], "apple");
+                // 第二个应该是 date（0.99+）
+                assert_eq!(rows[1][1], "date");
+                // 第三个应该是 elderberry（0.707）
+                assert_eq!(rows[2][1], "elderberry");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_vector_similarity_mixed_query() {
+        let mut executor = Executor::new();
+        setup_vector_table(&mut executor);
+
+        // 混合查询：WHERE 标量条件 + vector_similarity 阈值 + ORDER BY vector_similarity
+        let results = executor.execute(parse_sql(
+            "SELECT id, name FROM items WHERE id >= 3 AND vector_similarity(embedding, '[1.0,0.0,0.0]') > 0.5 ORDER BY vector_similarity(embedding, '[1.0,0.0,0.0]') DESC"
+        ).unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // id >= 3: cherry, date, elderberry
+                // vector_similarity > 0.5: cherry(0.0不匹配), date(0.993匹配), elderberry(0.707匹配)
+                // 按相似度降序: date, elderberry
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][1], "date");
+                assert_eq!(rows[1][1], "elderberry");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== 性能基线 =====
+
+    fn setup_big_vector_table(executor: &mut Executor) {
+        use std::time::Instant;
+        use crate::types::cosine_similarity;
+
+        executor.execute(parse_sql(
+            "CREATE TABLE vectors (id INTEGER, label TEXT, embedding VECTOR(128))"
+        ).unwrap()).unwrap();
+
+        let start = Instant::now();
+        for i in 0..1000 {
+            let vals: Vec<String> = (0..128).map(|j| {
+                format!("{:.4}", ((i as f64).sin() * (j as f64).cos() * 10.0).sin())
+            }).collect();
+            let vec_str = vals.join(",");
+            let sql = format!(
+                "INSERT INTO vectors (id, label, embedding) VALUES ({}, 'item_{}', '[{}]')",
+                i, i, vec_str
+            );
+            executor.execute(parse_sql(&sql).unwrap()).unwrap();
+        }
+        let elapsed = start.elapsed();
+        println!("[PERF] 插入 1000 行(128维): {:?} ({:.0} 行/秒)", elapsed, 1000.0 / elapsed.as_secs_f64());
+    }
+
+    #[test]
+    fn test_vector_similarity_perf_baseline() {
+        let mut executor = Executor::new();
+        setup_big_vector_table(&mut executor);
+
+        // 构建目标向量
+        let target_values: Vec<String> = (0..128).map(|j| format!("{:.4}", (j as f64 * 0.1).sin())).collect();
+        let target_str = target_values.join(",");
+
+        // 1. 标量查询基线
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            executor.execute(parse_sql("SELECT id, label FROM vectors WHERE id > 500").unwrap()).unwrap();
+        }
+        let scalar_elapsed = start.elapsed();
+        println!(
+            "[PERF] 标量查询 (100次, WHERE id > 500): {:?} (平均 {:.2}µs/次)",
+            scalar_elapsed,
+            scalar_elapsed.as_micros() as f64 / 100.0
+        );
+
+        // 2. 向量相似度查询
+        let query = format!(
+            "SELECT id, label FROM vectors WHERE vector_similarity(embedding, '[{}]') > 0.0 ORDER BY vector_similarity(embedding, '[{}]') DESC LIMIT 10",
+            target_str, target_str
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            executor.execute(parse_sql(&query).unwrap()).unwrap();
+        }
+        let vec_elapsed = start.elapsed();
+        println!(
+            "[PERF] 向量相似度查询 (10次, 128维, 1000行, WHERE+ORDER BY): {:?} (平均 {:.2}ms/次)",
+            vec_elapsed,
+            vec_elapsed.as_micros() as f64 / 10000.0
+        );
+
+        // 3. 混合查询
+        let mixed_query = format!(
+            "SELECT id, label FROM vectors WHERE id >= 0 AND vector_similarity(embedding, '[{}]') > 0.5 ORDER BY vector_similarity(embedding, '[{}]') DESC LIMIT 5",
+            target_str, target_str
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            executor.execute(parse_sql(&mixed_query).unwrap()).unwrap();
+        }
+        let mixed_elapsed = start.elapsed();
+        println!(
+            "[PERF] 混合查询 (10次, 标量+向量+ORDER BY): {:?} (平均 {:.2}ms/次)",
+            mixed_elapsed,
+            mixed_elapsed.as_micros() as f64 / 10000.0
+        );
     }
 }
