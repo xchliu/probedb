@@ -125,5 +125,100 @@ mod tests {
         // 重复建表
         assert!(db.execute("CREATE TABLE t (id INTEGER)").is_ok());
         assert!(db.execute("CREATE TABLE t (id INTEGER)").is_err());
+
+        // 插入不存在的表
+        assert!(db.execute("INSERT INTO ghost (id) VALUES (1)").is_err());
+
+        // 列数不匹配
+        assert!(db.execute("CREATE TABLE ctest (id INTEGER, name TEXT)").is_ok());
+        assert!(db.execute("INSERT INTO ctest (id) VALUES (1)").is_err(), "缺列插入当前版本不支持，应返回错误");
+    }
+
+    #[test]
+    fn test_empty_table_operations() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE empty (id INTEGER, name TEXT)").is_ok());
+
+        // 空表 SELECT
+        let r = db.execute("SELECT id, name FROM empty").unwrap();
+        assert!(r.contains("0 行"), "空表查询应返回 0 行");
+
+        // 空表 DELETE
+        let r = db.execute("DELETE FROM empty").unwrap();
+        assert!(r.contains("0 行"), "空表 DELETE 应返回 0");
+
+        // 空表 UPDATE
+        let r = db.execute("UPDATE empty SET name = 'xxx'").unwrap();
+        assert!(r.contains("0 行"), "空表 UPDATE 应返回 0");
+
+        // 空表 ORDER BY
+        let r = db.execute("SELECT id FROM empty ORDER BY id DESC").unwrap();
+        assert!(r.contains("0 行"), "空表 ORDER BY 应返回 0 行");
+    }
+
+    #[test]
+    fn test_where_no_match() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+        assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'hello')").is_ok());
+
+        // WHERE 无匹配
+        let r = db.execute("SELECT id FROM t WHERE id = 999").unwrap();
+        assert!(r.contains("0 行"), "无匹配 WHERE 应返回 0 行");
+
+        // DELETE WHERE 无匹配
+        let r = db.execute("DELETE FROM t WHERE id = 999").unwrap();
+        assert!(r.contains("0 行"), "DELETE 无匹配应返回 0 行");
+
+        // UPDATE WHERE 无匹配
+        let r = db.execute("UPDATE t SET name = 'x' WHERE id = 999").unwrap();
+        assert!(r.contains("0 行"), "UPDATE 无匹配应返回 0 行");
+    }
+
+    #[test]
+    fn test_like_patterns_integration() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+        assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'apple')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, name) VALUES (2, 'appetizer')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, name) VALUES (3, 'banana')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, name) VALUES (4, 'alphabet')").is_ok());
+
+        // LIKE 'app%'
+        let r = db.execute("SELECT id, name FROM t WHERE name LIKE 'app%'").unwrap();
+        assert!(r.contains("apple"), "LIKE 'app%' 应匹配 apple");
+        assert!(r.contains("appetizer"), "LIKE 'app%' 应匹配 appetizer");
+
+        // LIKE '%ana'
+        let r = db.execute("SELECT id, name FROM t WHERE name LIKE '%ana'").unwrap();
+        assert!(r.contains("banana"), "LIKE '%ana' 应匹配 banana");
+
+        // LIKE '%pp%'
+        let r = db.execute("SELECT id, name FROM t WHERE name LIKE '%pp%'").unwrap();
+        assert!(r.contains("apple"), "LIKE '%pp%' 应匹配 apple");
+    }
+
+    #[test]
+    fn test_multi_statement_batch() {
+        let mut db = ProbeDB::new();
+        let r = db.execute("CREATE TABLE t (id INTEGER); INSERT INTO t (id) VALUES (1); SELECT id FROM t").unwrap();
+        assert!(r.contains("1"), "多语句批处理应返回 INSERT 和 SELECT 结果");
+    }
+
+    #[test]
+    fn test_combined_crud_pipeline() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, val TEXT)").is_ok());
+        assert!(db.execute("INSERT INTO t (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')").is_ok());
+
+        // UPDATE
+        assert!(db.execute("UPDATE t SET val = 'updated' WHERE id = 1").is_ok());
+        let r = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert!(r.contains("updated"), "UPDATE 应生效");
+
+        // DELETE
+        assert!(db.execute("DELETE FROM t WHERE id = 3").is_ok());
+        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        assert!(r.contains("2 行"), "DELETE 后应剩 2 行");
     }
 }
