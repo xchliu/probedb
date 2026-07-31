@@ -5,6 +5,9 @@ mod sql;
 mod storage;
 mod types;
 mod executor;
+mod persistence;
+
+use std::path::Path;
 
 use executor::Executor;
 use sql::parse_sql;
@@ -12,13 +15,40 @@ use sql::parse_sql;
 /// ProbeDB 数据库实例（嵌入式模式入口）
 pub struct ProbeDB {
     executor: Executor,
+    /// 绑定的数据库文件路径（None = 纯内存模式）
+    path: Option<String>,
 }
 
 impl ProbeDB {
-    /// 创建一个新的 ProbeDB 实例
+    /// 创建一个新的 ProbeDB 实例（纯内存模式）
     pub fn new() -> Self {
         ProbeDB {
             executor: Executor::new(),
+            path: None,
+        }
+    }
+
+    /// 打开（或创建）磁盘上的数据库
+    ///
+    /// - 文件已存在 → 加载持久化状态
+    /// - 文件不存在 → 创建空库（首次 persist() 时落盘）
+    pub fn open(path: &str) -> Result<Self, String> {
+        let engine = if Path::new(path).exists() {
+            persistence::load(path)?
+        } else {
+            storage::StorageEngine::new()
+        };
+        Ok(ProbeDB {
+            executor: Executor { engine },
+            path: Some(path.to_string()),
+        })
+    }
+
+    /// 将当前状态原子保存到磁盘（临时文件 + rename）
+    pub fn persist(&self) -> Result<(), String> {
+        match &self.path {
+            Some(path) => persistence::save(&self.executor.engine, path),
+            None => Err("未绑定数据库文件，请使用 ProbeDB::open(path) 打开或创建数据库".to_string()),
         }
     }
 
@@ -220,5 +250,83 @@ mod tests {
         assert!(db.execute("DELETE FROM t WHERE id = 3").is_ok());
         let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
         assert!(r.contains("2 行"), "DELETE 后应剩 2 行");
+    }
+
+    // ===== 持久化测试（Phase 3） =====
+
+    fn temp_db_path(name: &str) -> String {
+        std::env::temp_dir().join(name).to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_probedb_open_persist_reload() {
+        let path = temp_db_path("probedb_open_persist_test.pdb");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+
+        // 第一次：open（新建）→ 写入数据 → persist
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)").is_ok());
+            assert!(db.execute("INSERT INTO users (id, name, age) VALUES (1, 'alice', 30)").is_ok());
+            assert!(db.execute("INSERT INTO users (id, name, age) VALUES (2, 'bob', 25)").is_ok());
+            db.persist().unwrap();
+        }
+
+        // 第二次：open（加载）→ 数据在 → 继续插入 id 连续
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            let r = db.execute("SELECT id, name FROM users ORDER BY id ASC").unwrap();
+            assert!(r.contains("alice"), "持久化后应能查到 alice");
+            assert!(r.contains("bob"), "持久化后应能查到 bob");
+            assert!(r.contains("2 行"), "应恢复 2 行数据");
+
+            // next_id 恢复正确：继续插入得到 id=3
+            assert!(db.execute("INSERT INTO users (id, name, age) VALUES (3, 'charlie', 35)").is_ok());
+            let r2 = db.execute("SELECT id FROM users WHERE id = 3").unwrap();
+            assert!(r2.contains("charlie"));
+            db.persist().unwrap();
+        }
+
+        // 第三次：再次加载验证增量持久化
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            let r = db.execute("SELECT id FROM users ORDER BY id ASC").unwrap();
+            assert!(r.contains("3 行"), "增量持久化后应 3 行");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+    }
+
+    #[test]
+    fn test_probedb_persist_with_vector() {
+        let path = temp_db_path("probedb_persist_vector_test.pdb");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE items (id INTEGER, emb VECTOR(2))").is_ok());
+            assert!(db.execute("INSERT INTO items (id, emb) VALUES (1, '[0.5,0.5]')").is_ok());
+            db.persist().unwrap();
+        }
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            // 向量数据恢复后仍可做相似度查询
+            let r = db.execute("SELECT id FROM items WHERE vector_similarity(emb, '[0.5,0.5]') > 0.9").unwrap();
+            assert!(r.contains("1"), "向量数据持久化后相似度查询应命中");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+    }
+
+    #[test]
+    fn test_probedb_persist_unbound_errors() {
+        let db = ProbeDB::new();
+        let r = db.persist();
+        assert!(r.is_err(), "纯内存模式 persist 应报错");
     }
 }
