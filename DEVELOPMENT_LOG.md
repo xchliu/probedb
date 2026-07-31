@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-07-31
+
+### 完成
+- **持久化引擎 Phase 3 第一步**：状态序列化 + 原子落盘/加载
+- `StorageEngine::export_state()` / `import_state()` — 文本行协议 v1（显式类型标记 + 转义）
+- 新增 `persistence` 模块：`save()`（临时文件 + rename 原子写）/ `load()`
+- `ProbeDB::open(path)` / `persist()` — 嵌入式 API，文件存在加载、不存在新建
+- 序列化格式支持全部4种类型（INTEGER/FLOAT/TEXT/VECTOR）+ next_id 恢复
+
+### 测试
+- 50 passed, 0 failed（新增8个：从42→50）
+- persistence 单元测试: save/load roundtrip（含 Text 含 `|` 转义）、覆盖保存、文件缺失报错、向量导出导入、import 替换旧状态
+- ProbeDB 集成测试: open→persist→reload 全链路（含 next_id 连续）、向量持久化后相似度查询、内存模式 persist 报错
+
+### 决策
+- 序列化格式：文本行协议（非二进制），方便调试和版本演进；`SCHEMA|...` / `ROW|...` / `NEXTID|...`
+- 值编码：显式类型标记 `INT:` / `FLOAT:` / `TEXT:` / `VEC:len:v1,v2,...`，杜绝歧义
+- 转义规则：`\` → `\\`，`|` → `\|`，`\n` → `\n`；解析用转义感知分割 `split_pipe_aware`（跳过转义对）
+- 原子写：先写 `<path>.tmp` 再 rename，崩溃不留半截文件
+- 持久化策略：全量快照（MVP），后续再评估 WAL 增量
+
+### 遇到的坑
+- ⚠️ 朴素 `line.split('|')` 会把转义的 `\|` 误切成两个字段（`TEXT:bob\|smith` → `bob\` + `smith`），导致反序列化失败。解法：`split_pipe_aware` 跳过转义对。
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（Phase 3 里程碑推进，建议坦哥确认后更新）
+
+---
+
 ## 2026-07-30
 
 ### 完成
