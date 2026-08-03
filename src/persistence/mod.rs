@@ -12,6 +12,8 @@ use std::path::Path;
 
 use crate::storage::StorageEngine;
 
+pub mod wal;
+
 /// 将引擎状态原子保存到文件
 ///
 /// 步骤：写 `<path>.tmp` → rename 到 `<path>`。

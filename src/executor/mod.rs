@@ -4,6 +4,7 @@ use crate::sql::SQLStatement;
 use crate::storage::*;
 use crate::types::Value;
 use crate::types::cosine_similarity;
+use crate::persistence::wal::WalLog;
 
 /// 执行结果
 #[derive(Debug)]
@@ -22,13 +23,24 @@ pub enum ExecuteResult {
 /// 执行器
 pub struct Executor {
     pub engine: StorageEngine,
+    /// 写前日志（None = 纯内存模式，不记录 WAL）
+    pub wal: Option<WalLog>,
 }
 
 impl Executor {
     pub fn new() -> Self {
         Executor {
             engine: StorageEngine::new(),
+            wal: None,
         }
+    }
+
+    /// 追加 WAL 记录（纯内存模式静默跳过）
+    fn append_wal(&mut self, entry: &str) -> Result<(), String> {
+        if let Some(wal) = &mut self.wal {
+            wal.append(entry)?;
+        }
+        Ok(())
     }
 
     pub fn execute(&mut self, stmts: Vec<SQLStatement>) -> Result<Vec<ExecuteResult>, String> {
@@ -52,6 +64,11 @@ impl Executor {
                         }
                     }).collect(),
                 };
+                // WAL 先写（T 记录），成功后改内存
+                let cols: Vec<String> = schema.columns.iter()
+                    .map(|c| format!("{}:{}", c.name, crate::storage::encode_type(&c.data_type)))
+                    .collect();
+                self.append_wal(&format!("T|{}|{}", name, cols.join("|")))?;
                 self.engine.create_table(schema)?;
                 Ok(ExecuteResult::TableCreated { name })
             }
@@ -74,6 +91,10 @@ impl Executor {
                 let all_parsed = rows_parsed?;
                 let count = all_parsed.len();
                 for row in all_parsed {
+                    // WAL 先写（I 记录，显式 row_id），成功后改内存
+                    let row_id = self.engine.next_id();
+                    let vals: Vec<String> = row.iter().map(crate::storage::encode_value).collect();
+                    self.append_wal(&format!("I|{}|{}|{}", table_name, row_id, vals.join("|")))?;
                     self.engine.insert(&table_name, row)?;
                 }
                 Ok(ExecuteResult::Message(format!("插入 {} 行数据", count)))
@@ -90,6 +111,10 @@ impl Executor {
                 };
 
                 let ids: Vec<u64> = matched.iter().map(|r| r.id).collect();
+                // WAL 先写（D 记录），成功后改内存
+                for id in &ids {
+                    self.append_wal(&format!("D|{}|{}", table_name, id))?;
+                }
                 let count = self.engine.delete_by_ids(&table_name, &ids)?;
                 Ok(ExecuteResult::Deleted { count })
             }
@@ -113,6 +138,11 @@ impl Executor {
                         .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
                     let value = parse_value(val_str, &col.data_type)
                         .map_err(|e| format!("解析更新值 '{}' 失败: {}", val_str, e))?;
+                    // WAL 先写（U 记录），成功后改内存
+                    let encoded = crate::storage::encode_value(&value);
+                    for id in &ids {
+                        self.append_wal(&format!("U|{}|{}|{}|{}", table_name, id, col.index, encoded))?;
+                    }
                     let count = self.engine.update_by_ids(&table_name, &ids, col.index, value)?;
                     total_updated += count;
                 }

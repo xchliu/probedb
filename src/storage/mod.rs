@@ -289,7 +289,7 @@ impl StorageEngine {
 }
 
 /// 编码数据类型为字符串
-fn encode_type(t: &DataType) -> String {
+pub(crate) fn encode_type(t: &DataType) -> String {
     match t {
         DataType::Integer => "INTEGER".to_string(),
         DataType::Float => "FLOAT".to_string(),
@@ -303,7 +303,7 @@ fn encode_type(t: &DataType) -> String {
 /// 保证 Text 值中的字面 `|`（编码为 `\|`）不会被误切成多个字段。
 /// 字节索引安全：`|`(0x7C) 和 `\`(0x5C) 都是单字节 ASCII，
 /// 多字节 UTF-8 字符的字节值 ≥ 0x80，不会干扰切片边界。
-fn split_pipe_aware(s: &str) -> Vec<&str> {
+pub(crate) fn split_pipe_aware(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0;
@@ -324,7 +324,7 @@ fn split_pipe_aware(s: &str) -> Vec<&str> {
 }
 
 /// 解码数据类型
-fn decode_type(s: &str) -> Result<DataType, String> {
+pub(crate) fn decode_type(s: &str) -> Result<DataType, String> {
     match s {
         "INTEGER" => Ok(DataType::Integer),
         "FLOAT" => Ok(DataType::Float),
@@ -339,7 +339,7 @@ fn decode_type(s: &str) -> Result<DataType, String> {
 }
 
 /// 编码值为字符串（显式类型标记）
-fn encode_value(v: &Value) -> String {
+pub(crate) fn encode_value(v: &Value) -> String {
     match v {
         Value::Integer(n) => format!("INT:{}", n),
         Value::Float(f) => format!("FLOAT:{}", f),
@@ -352,7 +352,7 @@ fn encode_value(v: &Value) -> String {
 }
 
 /// 解码值
-fn decode_value(s: &str) -> Result<Value, String> {
+pub(crate) fn decode_value(s: &str) -> Result<Value, String> {
     if let Some(rest) = s.strip_prefix("INT:") {
         return rest.parse::<i64>().map(Value::Integer)
             .map_err(|_| format!("整数解析失败: {}", s));

@@ -30,24 +30,50 @@ impl ProbeDB {
 
     /// 打开（或创建）磁盘上的数据库
     ///
-    /// - 文件已存在 → 加载持久化状态
+    /// - 文件已存在 → 加载持久化状态 + 重放 WAL（崩溃恢复）
     /// - 文件不存在 → 创建空库（首次 persist() 时落盘）
+    ///
+    /// 崩溃恢复流程：load 全量快照 → replay WAL 增量 → 若重放了记录，
+    /// 立即把恢复结果固化回快照并截断 WAL（避免下次重复重放）。
     pub fn open(path: &str) -> Result<Self, String> {
-        let engine = if Path::new(path).exists() {
-            persistence::load(path)?
+        let (engine, wal) = if Path::new(path).exists() {
+            let mut engine = persistence::load(path)?;
+            let wal_path = format!("{}.wal", path);
+            if Path::new(&wal_path).exists() {
+                let mut wal = persistence::wal::WalLog::open(&wal_path)?;
+                let replayed = wal.replay(&mut engine)?;
+                if replayed > 0 {
+                    persistence::save(&engine, path)?;
+                    wal.truncate()?;
+                }
+                (engine, Some(wal))
+            } else {
+                (engine, None)
+            }
         } else {
-            storage::StorageEngine::new()
+            // 新库：同时创建空引擎和 WAL（从第一条 DML 就开始记录）
+            let wal_path = format!("{}.wal", path);
+            let wal = persistence::wal::WalLog::open(&wal_path)?;
+            (storage::StorageEngine::new(), Some(wal))
         };
         Ok(ProbeDB {
-            executor: Executor { engine },
+            executor: Executor { engine, wal },
             path: Some(path.to_string()),
         })
     }
 
     /// 将当前状态原子保存到磁盘（临时文件 + rename）
-    pub fn persist(&self) -> Result<(), String> {
+    ///
+    /// 快照落盘成功后截断 WAL：增量日志已并入快照，避免下次重放重复。
+    pub fn persist(&mut self) -> Result<(), String> {
         match &self.path {
-            Some(path) => persistence::save(&self.executor.engine, path),
+            Some(path) => {
+                persistence::save(&self.executor.engine, path)?;
+                if let Some(wal) = &mut self.executor.wal {
+                    wal.truncate()?;
+                }
+                Ok(())
+            }
             None => Err("未绑定数据库文件，请使用 ProbeDB::open(path) 打开或创建数据库".to_string()),
         }
     }
@@ -325,8 +351,98 @@ mod tests {
 
     #[test]
     fn test_probedb_persist_unbound_errors() {
-        let db = ProbeDB::new();
+        let mut db = ProbeDB::new();
         let r = db.persist();
         assert!(r.is_err(), "纯内存模式 persist 应报错");
+    }
+
+    #[test]
+    fn test_probedb_wal_crash_recovery() {
+        // 场景：open → 建表+插入 → persist（快照+WAL清空）
+        //       → 继续插入/更新/删除（不 persist，只写 WAL）
+        //       → 重新 open → WAL 重放 → 数据完整恢复
+        let path = temp_db_path("probedb_wal_crash_test.pdb");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+
+        // 第一次会话：建表+插入2行 → persist（快照已落盘，WAL 清空）
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'alice')").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (2, 'bob')").is_ok());
+            db.persist().unwrap();
+        }
+
+        // 第二次会话（模拟崩溃前）：插入3行、更新1行、删除1行，全部只写 WAL 不 persist
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (3, 'charlie')").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (4, 'dave')").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (5, 'eve')").is_ok());
+            assert!(db.execute("UPDATE t SET name = 'alice2' WHERE id = 1").is_ok());
+            assert!(db.execute("DELETE FROM t WHERE id = 2").is_ok());
+            // 崩溃：不 persist，直接 drop
+        }
+
+        // WAL 应有记录（3插入+1更新+1删除 = 5条）
+        let wal = persistence::wal::WalLog::open(&wal_path).unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 5, "崩溃前应有5条WAL记录");
+
+        // 第三次会话：重新 open → 自动重放 WAL 恢复
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            let r = db.execute("SELECT id, name FROM t ORDER BY id ASC").unwrap();
+            assert!(r.contains("alice2"), "UPDATE 应恢复（alice → alice2）");
+            assert!(r.contains("charlie"), "未落盘 INSERT 应恢复");
+            assert!(r.contains("eve"), "未落盘 INSERT 应恢复");
+            assert!(!r.contains("bob"), "未落盘 DELETE 应生效");
+            assert!(r.contains("4 行"), "恢复后应 4 行（1,3,4,5）");
+        }
+
+        // 重放后 WAL 已固化并截断
+        let wal2 = persistence::wal::WalLog::open(&wal_path).unwrap();
+        assert_eq!(wal2.entry_count().unwrap(), 0, "重放固化后 WAL 应清空");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn test_probedb_wal_persist_truncates() {
+        // persist 后 WAL 必须清空，再次崩溃重启不会重复重放
+        let path = temp_db_path("probedb_wal_truncate_test.pdb");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER)").is_ok());
+            assert!(db.execute("INSERT INTO t (id) VALUES (1)").is_ok());
+            assert!(db.execute("INSERT INTO t (id) VALUES (2)").is_ok());
+            db.persist().unwrap(); // 快照+清WAL
+            assert!(db.execute("INSERT INTO t (id) VALUES (3)").is_ok());
+            assert!(db.execute("INSERT INTO t (id) VALUES (4)").is_ok());
+            db.persist().unwrap(); // 再次快照+清WAL
+        }
+
+        // WAL 应为空
+        let wal = persistence::wal::WalLog::open(&wal_path).unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 0, "persist 后 WAL 应清空");
+
+        // 重启后 4 行都在，且无重复
+        let mut db = ProbeDB::open(&path).unwrap();
+        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        assert!(r.contains("4 行"), "应有 4 行");
+        assert!(!r.contains("8 行"), "不得重复重放");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
     }
 }
