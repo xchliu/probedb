@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-08-03
+
+### 完成
+- **WAL（Write-Ahead Log）写入路径 + 崩溃恢复**（Phase 3 周一任务）
+- 新增 `persistence::wal` 模块：追加式文本行协议，4 种记录
+  - `T|<table>|<col>:<type>|...` — CREATE TABLE
+  - `I|<table>|<row_id>|<value>|...` — INSERT（显式 row_id，重放幂等）
+  - `D|<table>|<row_id>` — DELETE（重放幂等）
+  - `U|<table>|<row_id>|<col_index>|<value>` — UPDATE（重放幂等）
+- **写入路径接入**：executor 4 个 DML 分支（CreateTable/Insert/Delete/Update）先写 WAL 再改内存，遵循 write-ahead 语义
+- **崩溃恢复**：`ProbeDB::open()` = load 全量快照 + replay WAL 增量；重放后立即固化回快照并 truncate WAL（避免下次重复重放）
+- **原子性保证**：快照+WAL 组合 — persist() = save 快照（原子 rename）+ truncate WAL；新库自动初始化 WAL（从第一条 DML 开始记录）
+- **恢复韧性**：重放时损坏行跳过不整体失败（eprintln 记录行号）；幂等重放（表/行已存在跳过，DELETE/UPDATE 对不存在行无操作）
+
+### 测试
+- 56 passed, 0 failed（新增 6 个：从 50→56）
+- wal 单元测试: append 追加模式、重放恢复完整操作链（含 `|` 转义）、幂等重放（快照+WAL 重复不产生重复行）、损坏行跳过
+- ProbeDB 集成测试: 崩溃恢复全流程（persist→再写不persist→reopen→WAL重放→数据完整→WAL清空）、persist 后 WAL 截断无重复重放
+
+### 决策
+- WAL 格式复用快照的文本行协议 + 转义规则（`split_pipe_aware` / `encode_value` 改为 `pub(crate)` 复用）
+- 单字符操作码（T/I/D/U）紧凑可读；显式 row_id 让重放不依赖自增计数器
+- 幂等设计是快照+WAL 组合的正确性基石：persist 成功但 truncate 前崩溃的场景不会重复插入
+- 重放损坏行跳过而非整体失败：一条坏记录不能毁掉整个库（周五"数据损坏检测"的提前量）
+
+### 遇到的坑
+- ⚠️ 新建库（path 不存在）时 wal 初始化为 None → WAL 文件从未创建，崩溃恢复测试失败。解法：新库分支也调用 `WalLog::open` 初始化 WAL
+- ⚠️ 测试手写 WAL 记录时 `TEXT:bob|smith` 未转义 → 重放把 `smith` 当成新字段解析失败。WAL 记录中的字面 `|` 必须写 `\|`
+
+---
+
 ## 2026-07-31
 
 ### 完成
