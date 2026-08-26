@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-08-26
+
+### 完成
+- **快照恢复完整性**（Phase 3 周二任务）：新增 `validate_header()` 头部校验（空文件/非ProbeDB格式/版本不匹配→明确报错），`load()` 集成校验后再 import_state；为 v2 格式迁移预留入口
+- **持久化性能优化**（Phase 3 周三任务）：
+  - **WAL 批量模式**：`WalLog::set_batch(true)` 后 append 只进内存 `pending` 缓冲，`flush()` 一次性 write_all + 单次 fsync 落盘（原同步模式每条记录一次 fsync）
+  - **延迟持久化（可配置）**：`set_auto_flush_threshold(n)` 达阈值自动刷盘；`set_batch(false)` 自动 flush 剩余；`ProbeDB::set_batch_mode()/flush()` 对外接口
+  - **persist() 语义强化**：先 flush pending → save 快照 → truncate WAL（批量模式数据不会丢在快照外）
+  - **性能基线**：1000条INSERT 内存 13.3ms / 同步 19.5ms / 批量 14.5ms（批量接近内存，比同步快26%）；恢复1000行 3.9ms
+
+### 测试
+- 71 passed, 0 failed（从 63→71，新增 8 个）
+- WAL 单元测试: 批量累积后 flush、关闭批量自动落盘、自动刷盘阈值、批量顺序保持（T/I/U/D 混合按序重放）
+- ProbeDB 集成测试: 批量模式崩溃丢失未flush记录（延迟持久化预期权衡）、flush后崩溃可恢复、persist自动flush、性能基线
+
+### 决策
+- 批量模式是显式的性能/持久性权衡：同步模式（默认）每条 DML 立即 fsync 最安全；批量模式适合批量导入/大量写入，崩溃最多丢失未 flush 的缓冲记录
+- WAL 重放幂等设计让批量模式安全：即使 flush 边界与内存操作不完全对齐，重放也不会产生重复副作用
+- 关闭批量模式自动 flush：保证模式切换后语义不静默变化
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-08-03
 
 ### 完成
