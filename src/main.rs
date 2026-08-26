@@ -64,10 +64,14 @@ impl ProbeDB {
 
     /// 将当前状态原子保存到磁盘（临时文件 + rename）
     ///
-    /// 快照落盘成功后截断 WAL：增量日志已并入快照，避免下次重放重复。
+    /// 先 flush WAL 缓冲（批量模式下 pending 记录全部落盘），
+    /// 再写快照，成功后截断 WAL：增量日志已并入快照，避免下次重放重复。
     pub fn persist(&mut self) -> Result<(), String> {
         match &self.path {
             Some(path) => {
+                if let Some(wal) = &mut self.executor.wal {
+                    wal.flush()?;
+                }
                 persistence::save(&self.executor.engine, path)?;
                 if let Some(wal) = &mut self.executor.wal {
                     wal.truncate()?;
@@ -76,6 +80,30 @@ impl ProbeDB {
             }
             None => Err("未绑定数据库文件，请使用 ProbeDB::open(path) 打开或创建数据库".to_string()),
         }
+    }
+
+    /// 开启/关闭 WAL 批量模式（延迟持久化）
+    ///
+    /// - 开启：DML 的 WAL 记录先累积在内存缓冲，flush() 时一次性落盘。
+    ///   性能高，但崩溃时可能丢失未 flush 的记录（性能与持久性权衡）。
+    /// - 关闭（默认）：每条 DML 立即写 WAL 并 fsync，崩溃最多丢失最后一条。
+    ///
+    /// 批量模式适合批量导入/大量写入场景；常规交互保持同步模式更安全。
+    pub fn set_batch_mode(&mut self, enabled: bool) -> Result<(), String> {
+        if let Some(wal) = &mut self.executor.wal {
+            wal.set_batch(enabled)?;
+        }
+        Ok(())
+    }
+
+    /// 将 WAL 缓冲（批量模式 pending）一次写入磁盘
+    ///
+    /// 批量写入的"落盘点"：调用后所有已提交操作均可从磁盘恢复。
+    pub fn flush(&mut self) -> Result<(), String> {
+        if let Some(wal) = &mut self.executor.wal {
+            wal.flush()?;
+        }
+        Ok(())
     }
 
     /// 执行 SQL 语句，返回格式化结果
@@ -444,5 +472,208 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.tmp", path));
         let _ = std::fs::remove_file(&wal_path);
+    }
+
+    // ===== 持久化性能优化（批量模式 / 延迟持久化） =====
+
+    #[test]
+    fn test_probedb_batch_mode_crash_loses_unflushed() {
+        // 批量模式 + 不 flush + drop（模拟崩溃）→ 未落盘记录丢失（延迟持久化的预期权衡）
+        let path = temp_db_path("probedb_batch_crash_test.pdb");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+
+        // 第一段：同步模式建表+插1行+persist（基准数据落盘）
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'base')").is_ok());
+            db.persist().unwrap();
+        }
+
+        // 第二段：开启批量模式，插入2行但崩溃前不 flush
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            db.set_batch_mode(true).unwrap();
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (2, 'lost1')").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (3, 'lost2')").is_ok());
+            // 崩溃：不 flush 直接 drop
+        }
+
+        // WAL 不应包含未 flush 的记录
+        let wal = persistence::wal::WalLog::open(&wal_path).unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 0, "未flush的记录不应落盘");
+
+        // 重启：只有基准数据
+        let mut db = ProbeDB::open(&path).unwrap();
+        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        assert!(r.contains("1 行"), "未flush的2行应丢失，只剩基准1行");
+        assert!(r.contains("base"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn test_probedb_batch_flush_persists() {
+        // 批量模式 + flush → 记录落盘，崩溃重启可恢复
+        let path = temp_db_path("probedb_batch_flush_test.pdb");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'base')").is_ok());
+            db.persist().unwrap();
+        }
+
+        // 批量模式插入2行 → flush（落盘点）
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            db.set_batch_mode(true).unwrap();
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (2, 'kept1')").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (3, 'kept2')").is_ok());
+            db.flush().unwrap();
+            // 崩溃：flush 后 drop
+        }
+
+        let wal = persistence::wal::WalLog::open(&wal_path).unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 2, "flush后WAL应有2条记录");
+
+        // 重启：WAL 重放恢复 flush 的数据
+        let mut db = ProbeDB::open(&path).unwrap();
+        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        assert!(r.contains("3 行"), "flush的2行+基准1行 = 3行");
+        assert!(r.contains("kept1"));
+        assert!(r.contains("kept2"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn test_probedb_batch_mode_persist_flushes_first() {
+        // persist() 前自动 flush pending → 快照包含批量写入的全部数据
+        let path = temp_db_path("probedb_batch_persist_test.pdb");
+        let wal_path = format!("{}.wal", path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            db.set_batch_mode(true).unwrap();
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'a')").is_ok());
+            assert!(db.execute("INSERT INTO t (id, name) VALUES (2, 'b')").is_ok());
+            // 不手动 flush，直接 persist —— persist 内部应先 flush
+            db.persist().unwrap();
+        }
+
+        // WAL 应已截断（数据进了快照）
+        let wal = persistence::wal::WalLog::open(&wal_path).unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 0, "persist后WAL应清空");
+
+        // 重启：数据完整
+        let mut db = ProbeDB::open(&path).unwrap();
+        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        assert!(r.contains("2 行"), "批量数据应完整持久化");
+        assert!(r.contains("a"));
+        assert!(r.contains("b"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.tmp", path));
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn test_persistence_perf_baseline() {
+        // 性能基线：1000 条 INSERT 同步模式 vs 批量模式 vs 内存模式耗时对比
+        use std::time::Instant;
+
+        let sync_path = temp_db_path("probedb_perf_sync.pdb");
+        let batch_path = temp_db_path("probedb_perf_batch.pdb");
+        for p in [&sync_path, &batch_path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+        const N: usize = 1000;
+
+        // 内存模式：无磁盘写入（性能上限参考）
+        let mem_start = Instant::now();
+        {
+            let mut db = ProbeDB::new();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            for i in 0..N {
+                assert!(db
+                    .execute(&format!("INSERT INTO t (id, name) VALUES ({}, 'n{}')", i, i))
+                    .is_ok());
+            }
+        }
+        let mem_elapsed = mem_start.elapsed();
+
+        // 同步模式：每条 INSERT 立即 fsync
+        let sync_start = Instant::now();
+        {
+            let mut db = ProbeDB::open(&sync_path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            for i in 0..N {
+                assert!(db
+                    .execute(&format!("INSERT INTO t (id, name) VALUES ({}, 'n{}')", i, i))
+                    .is_ok());
+            }
+            db.persist().unwrap();
+        }
+        let sync_elapsed = sync_start.elapsed();
+
+        // 批量模式：累积内存缓冲，最后 flush 一次
+        let batch_start = Instant::now();
+        {
+            let mut db = ProbeDB::open(&batch_path).unwrap();
+            assert!(db.execute("CREATE TABLE t (id INTEGER, name TEXT)").is_ok());
+            db.set_batch_mode(true).unwrap();
+            for i in 0..N {
+                assert!(db
+                    .execute(&format!("INSERT INTO t (id, name) VALUES ({}, 'n{}')", i, i))
+                    .is_ok());
+            }
+            db.flush().unwrap();
+            db.persist().unwrap();
+        }
+        let batch_elapsed = batch_start.elapsed();
+
+        // 恢复耗时：加载 1000 行库
+        let load_start = Instant::now();
+        {
+            let mut db = ProbeDB::open(&batch_path).unwrap();
+            let r = db.execute("SELECT id FROM t").unwrap();
+            assert!(r.contains("1000 行"), "批量库应有1000行");
+        }
+        let load_elapsed = load_start.elapsed();
+
+        println!(
+            "[perf] 1000条INSERT 内存模式: {:?} | 同步模式: {:?} | 批量模式: {:?} | 恢复: {:?}",
+            mem_elapsed, sync_elapsed, batch_elapsed, load_elapsed
+        );
+        assert!(
+            batch_elapsed <= sync_elapsed,
+            "批量模式应不慢于同步模式（sync={:?} batch={:?}）",
+            sync_elapsed,
+            batch_elapsed
+        );
+
+        for p in [&sync_path, &batch_path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
     }
 }

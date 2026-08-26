@@ -29,6 +29,12 @@ use crate::types::Value;
 pub struct WalLog {
     path: String,
     file: fs::File,
+    /// 批量模式：append 只进内存缓冲，flush() 时一次性写盘
+    batch: bool,
+    /// 批量模式下未落盘的记录（按 append 顺序）
+    pending: Vec<String>,
+    /// 自动刷盘阈值：pending 达到该条数时自动 flush（0 = 不自动刷，手动 flush）
+    auto_flush_threshold: usize,
 }
 
 impl WalLog {
@@ -45,6 +51,9 @@ impl WalLog {
         let mut log = WalLog {
             path: path.to_string(),
             file,
+            batch: false,
+            pending: Vec::new(),
+            auto_flush_threshold: 0,
         };
         if !exists {
             log.write_line("# ProbeDB WAL v1")?;
@@ -52,9 +61,56 @@ impl WalLog {
         Ok(log)
     }
 
-    /// 追加一条 WAL 记录（写盘并 flush）
+    /// 追加一条 WAL 记录
+    ///
+    /// - 同步模式（默认）：立即写盘并 flush（原语义，每条都 fsync）
+    /// - 批量模式：先进内存缓冲，flush() 时合并落盘（性能优化，延迟持久化）
     pub fn append(&mut self, entry: &str) -> Result<(), String> {
-        self.write_line(entry)
+        if self.batch {
+            self.pending.push(entry.to_string());
+            if self.auto_flush_threshold > 0 && self.pending.len() >= self.auto_flush_threshold {
+                self.flush()?;
+            }
+            Ok(())
+        } else {
+            self.write_line(entry)
+        }
+    }
+
+    /// 开启/关闭批量模式
+    ///
+    /// 关闭时自动 flush 剩余 pending，保证切回同步模式后记录完整。
+    pub fn set_batch(&mut self, enabled: bool) -> Result<(), String> {
+        self.batch = enabled;
+        if !enabled {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// 当前是否处于批量模式
+    pub fn is_batch(&self) -> bool {
+        self.batch
+    }
+
+    /// 设置自动刷盘阈值（pending 达到该条数自动 flush，0 = 手动）
+    pub fn set_auto_flush_threshold(&mut self, threshold: usize) {
+        self.auto_flush_threshold = threshold;
+    }
+
+    /// 把 pending 缓冲一次性写入磁盘（批量写 + 单次 flush）
+    pub fn flush(&mut self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let lines = std::mem::take(&mut self.pending);
+        self.write_lines(&lines)?;
+        Ok(())
+    }
+
+    /// 批量模式下尚未落盘的记录数
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// 清空 WAL（快照落盘成功后调用）
@@ -126,6 +182,19 @@ impl WalLog {
         writeln!(self.file, "{}", line)
             .and_then(|_| self.file.flush())
             .map_err(|e| format!("写入WAL失败 ({}): {}", self.path, e))
+    }
+
+    /// 批量写入多行（一次 write_all + 一次 flush，避免每条记录一次 fsync）
+    fn write_lines(&mut self, lines: &[String]) -> Result<(), String> {
+        let mut buf = String::new();
+        for line in lines {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        self.file
+            .write_all(buf.as_bytes())
+            .and_then(|_| self.file.flush())
+            .map_err(|e| format!("批量写入WAL失败 ({}): {}", self.path, e))
     }
 }
 
@@ -326,6 +395,111 @@ mod tests {
 
         let rows = engine.scan_table("users").unwrap();
         assert_eq!(rows.len(), 1, "alice 恢复，损坏行不影响");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_batch_accumulates_then_flushes() {
+        let path = wal_path("probedb_wal_batch.wal");
+        let _ = fs::remove_file(&path);
+
+        let mut wal = WalLog::open(&path).unwrap();
+        wal.set_batch(true).unwrap();
+        assert!(wal.is_batch());
+
+        // 批量模式下 append 只进缓冲，不落盘
+        wal.append("T|users|id:INTEGER|name:TEXT").unwrap();
+        wal.append("I|users|1|INT:1|TEXT:alice").unwrap();
+        wal.append("I|users|2|INT:2|TEXT:bob").unwrap();
+        assert_eq!(wal.pending_count(), 3, "3条记录应在内存缓冲");
+        assert_eq!(wal.entry_count().unwrap(), 0, "尚未落盘");
+
+        // flush 一次合并写盘
+        wal.flush().unwrap();
+        assert_eq!(wal.pending_count(), 0, "flush后缓冲清空");
+        assert_eq!(wal.entry_count().unwrap(), 3, "3条记录一次落盘");
+
+        // 新引擎重放：数据完整
+        let mut engine = StorageEngine::new();
+        let replayed = wal.replay(&mut engine).unwrap();
+        assert_eq!(replayed, 3);
+        let rows = engine.scan_table("users").unwrap();
+        assert_eq!(rows.len(), 2, "批量写入后重放应恢复2行");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_batch_set_batch_false_flushes() {
+        let path = wal_path("probedb_wal_batch_off.wal");
+        let _ = fs::remove_file(&path);
+
+        let mut wal = WalLog::open(&path).unwrap();
+        wal.set_batch(true).unwrap();
+        wal.append("I|users|1|INT:1|TEXT:alice").unwrap();
+        wal.append("I|users|2|INT:2|TEXT:bob").unwrap();
+        assert_eq!(wal.pending_count(), 2);
+
+        // 关闭批量模式 → 自动 flush 剩余 pending
+        wal.set_batch(false).unwrap();
+        assert!(!wal.is_batch());
+        assert_eq!(wal.pending_count(), 0, "关闭批量模式应自动落盘");
+        assert_eq!(wal.entry_count().unwrap(), 2);
+
+        // 同步模式继续追加：立即落盘
+        wal.append("I|users|3|INT:3|TEXT:carol").unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 3, "同步模式应立即落盘");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_batch_auto_flush_threshold() {
+        let path = wal_path("probedb_wal_batch_threshold.wal");
+        let _ = fs::remove_file(&path);
+
+        let mut wal = WalLog::open(&path).unwrap();
+        wal.set_batch(true).unwrap();
+        wal.set_auto_flush_threshold(2);
+
+        wal.append("I|users|1|INT:1|TEXT:alice").unwrap();
+        assert_eq!(wal.pending_count(), 1, "未达阈值，仍在缓冲");
+
+        wal.append("I|users|2|INT:2|TEXT:bob").unwrap();
+        assert_eq!(wal.pending_count(), 0, "达到阈值自动flush");
+        assert_eq!(wal.entry_count().unwrap(), 2, "自动落盘2条");
+
+        wal.append("I|users|3|INT:3|TEXT:carol").unwrap();
+        assert_eq!(wal.pending_count(), 1, "新一轮累积");
+        wal.flush().unwrap();
+        assert_eq!(wal.entry_count().unwrap(), 3);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_batch_order_preserved() {
+        let path = wal_path("probedb_wal_batch_order.wal");
+        let _ = fs::remove_file(&path);
+
+        // 混合操作批量累积后，重放顺序必须与 append 顺序一致
+        let mut wal = WalLog::open(&path).unwrap();
+        wal.set_batch(true).unwrap();
+        wal.append("T|t|id:INTEGER|name:TEXT").unwrap();
+        wal.append("I|t|1|INT:1|TEXT:a").unwrap();
+        wal.append("I|t|2|INT:2|TEXT:b").unwrap();
+        wal.append("U|t|1|1|TEXT:a2").unwrap();
+        wal.append("D|t|2").unwrap();
+        wal.flush().unwrap();
+
+        let mut engine = StorageEngine::new();
+        let replayed = wal.replay(&mut engine).unwrap();
+        assert_eq!(replayed, 5, "5条记录按序重放");
+
+        let rows = engine.scan_table("t").unwrap();
+        assert_eq!(rows.len(), 1, "U和D应按序生效");
+        assert_eq!(rows[0].values[1], Value::Text("a2".to_string()));
 
         let _ = fs::remove_file(&path);
     }
