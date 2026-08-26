@@ -29,18 +29,50 @@ pub fn save(engine: &StorageEngine, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 当前快照格式版本（export_state 头部魔数）
+const STATE_HEADER_V1: &str = "# ProbeDB state v1";
+
 /// 从文件加载引擎状态
 ///
 /// 文件不存在时返回 Err（调用方决定是报错还是新建空库）。
+/// 做完整性校验：魔数/版本不匹配、空文件、损坏内容均返回 Err。
 pub fn load(path: &str) -> Result<StorageEngine, String> {
     if !Path::new(path).exists() {
         return Err(format!("数据库文件不存在: {}", path));
     }
     let state = fs::read_to_string(path)
         .map_err(|e| format!("读取数据库文件失败 ({}): {}", path, e))?;
+    // 完整性校验：空文件 / 非ProbeDB格式 / 版本不匹配 → 明确报错
+    validate_header(&state)?;
     let mut engine = StorageEngine::new();
     engine.import_state(&state)?;
     Ok(engine)
+}
+
+/// 校验快照头部（版本/魔数），返回错误信息或 Ok(())
+///
+/// 独立于 import_state 的格式检查，用于：
+/// - 空文件 / 不是ProbeDB格式 → 明确报错（避免把任意文本当数据库）
+/// - 未来版本升级：v2 格式由调用方决定迁移或拒绝
+pub fn validate_header(state: &str) -> Result<(), String> {
+    let first_line = state.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return Err("数据库文件为空".to_string());
+    }
+    if !first_line.starts_with("# ProbeDB state") {
+        return Err(format!(
+            "数据库文件头无效（不是ProbeDB快照或已损坏）: '{}'",
+            first_line
+        ));
+    }
+    // 已知版本：v1。未知更高版本 → 拒绝（防止新版本写的数据被旧版本误读）
+    if first_line != STATE_HEADER_V1 {
+        return Err(format!(
+            "数据库版本不匹配: 期望 '{}'，实际 '{}'",
+            STATE_HEADER_V1, first_line
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -166,7 +198,7 @@ mod tests {
     #[test]
     fn test_import_after_use_replaces_state() {
         // import_state 应清空旧状态，而不是叠加
-        use crate::storage::{TableSchema, ColumnInfo};
+        use crate::storage::{ColumnInfo, TableSchema};
         use crate::types::{DataType, Value};
 
         let mut engine = StorageEngine::new();
@@ -180,5 +212,87 @@ mod tests {
 
         assert_eq!(engine.table_names(), vec!["users".to_string()]);
         assert_eq!(engine.scan_table("users").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_validate_header_ok() {
+        // 正常快照头部应通过校验
+        let state = build_engine().export_state();
+        assert!(validate_header(&state).is_ok());
+    }
+
+    #[test]
+    fn test_validate_header_empty_file() {
+        // 空文件 → 明确报错
+        let e = validate_header("").unwrap_err();
+        assert!(e.contains("空"), "空文件应报'空'错误, got: {}", e);
+    }
+
+    #[test]
+    fn test_validate_header_not_probedb_format() {
+        // 任意文本（非ProbeDB格式）→ 明确报错
+        let e = validate_header("hello world, this is not a database").unwrap_err();
+        assert!(e.contains("无效"), "非ProbeDB格式应报'无效', got: {}", e);
+    }
+
+    #[test]
+    fn test_validate_header_version_mismatch() {
+        // 未来版本（v2）→ 版本不匹配报错，防止旧版误读新版数据
+        let e = validate_header("# ProbeDB state v2\nSCHEMA|t|id:INTEGER").unwrap_err();
+        assert!(e.contains("版本不匹配"), "v2应报版本不匹配, got: {}", e);
+    }
+
+    #[test]
+    fn test_load_corrupted_file_errors() {
+        // 损坏的数据库文件（非ProbeDB格式）→ load 明确报错
+        let tmp = std::env::temp_dir().join("probedb_corrupt.pdb");
+        let path = tmp.to_str().unwrap().to_string();
+        fs::write(&path, "this is garbage data, not a probedb snapshot").unwrap();
+
+        let r = load(&path);
+        assert!(r.is_err(), "损坏文件应加载失败");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_empty_file_errors() {
+        // 空数据库文件 → load 明确报错（而非静默当空库）
+        let tmp = std::env::temp_dir().join("probedb_empty.pdb");
+        let path = tmp.to_str().unwrap().to_string();
+        fs::write(&path, "").unwrap();
+
+        let r = load(&path);
+        assert!(r.is_err(), "空文件应加载失败");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_save_load_empty_database() {
+        // 空库（只有表结构，无数据）保存→加载→表结构完整
+        let tmp = std::env::temp_dir().join("probedb_empty_db.pdb");
+        let path = tmp.to_str().unwrap().to_string();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.tmp", path));
+
+        let mut engine = StorageEngine::new();
+        use crate::storage::{ColumnInfo, TableSchema};
+        use crate::types::DataType;
+        engine.create_table(TableSchema {
+            name: "empty".to_string(),
+            columns: vec![
+                ColumnInfo { name: "id".to_string(), data_type: DataType::Integer, index: 0 },
+                ColumnInfo { name: "emb".to_string(), data_type: DataType::Vector(2), index: 1 },
+            ],
+        }).unwrap();
+        save(&engine, &path).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.table_names(), vec!["empty".to_string()]);
+        assert_eq!(loaded.scan_table("empty").unwrap().len(), 0, "空表加载后仍为空");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.tmp", path));
     }
 }
