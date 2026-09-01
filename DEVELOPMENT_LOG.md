@@ -4,6 +4,42 @@
 
 ---
 
+## 2026-09-01
+
+### 完成
+- **Hermes 接口定义（Phase 3 周四任务）**：三方案选型（C ABI / pyo3 / IPC）→ 选 **C ABI (cdylib)**，理由：零外部依赖铁律 + 嵌入式模式 + 跨语言通用性（未来 Go/Node/Swift 都能调）
+- **C ABI 实现 `src/ffi.rs`**：8 个导出函数（open/execute/persist/set_batch_mode/last_error/free_string/close）
+  - 内存所有权：Rust 侧分配由 `probedb_free_string` 释放（谁分配谁释放）
+  - panic 安全：所有入口 catch_unwind，panic 不跨 FFI 边界
+  - NULL 语义：失败返回 NULL + 全局 last_error（Mutex 保护）
+- **工程结构拆分**：main.rs（二进制）→ lib.rs（库）+ main.rs（入口），Cargo.toml 加 `[lib] crate-type=["rlib","cdylib"]`
+- **Python 桥接层 `bridge/probedb.py`**：ctypes 封装，仿 sqlite3 用法（with 语句 + execute/persist/close），~130 行
+- **真实链路验证**：CRUD + 向量混合查询（vector_similarity > 0.7 ORDER BY DESC）+ 持久化重开，全部通过
+
+### 测试
+- 75 passed, 0 failed（从 71→75，新增 4 个 FFI 测试）
+- test_ffi_memory_mode_crud：内存模式建表/插入/查询
+- test_ffi_error_propagation：错误返回 NULL + last_error 携带表名
+- test_ffi_null_guard：NULL 句柄/NULL SQL 防护
+- test_ffi_persist_reopen：持久化 → 重开 → 数据恢复
+
+### 决策
+- **接口选型：C ABI (cdylib)**。pyo3 开发体验好但引入外部 crate 破坏零依赖铁律且仅限 Python；IPC 违背嵌入式定位（第一版是进程内调用）
+- **协议 v1 最小集**：8 个函数，SQL 文本进出（结果格式化文本，错误走 last_error），保持简单
+- **Python 桥接 restype 用 c_void_p**：ctypes 的 c_char_p restype 会把指针转 bytes 拷贝，再 free 会 abort（真实踩坑，已修复）
+
+### 遇到的坑
+- ⚠️ ctypes `restype=c_char_p` + `free_string` → 释放错误指针 → Python abort（SIGABRT）。解法：restype 改 c_void_p 拿原始指针，string_at 读取，free_string 释放原指针
+- ⚠️ cdylib crate-type 需要 lib.rs 作为库入口（main.rs 只有 bin 目标）→ 拆分 lib.rs + main.rs
+- ⚠️ 拆出 lib 后 doctest 开始执行，storage/mod.rs 的 `ProbeDB state v1` 格式示例被当 Rust 代码 → 改 ```text
+
+### 文档更新
+- [x] 周计划更新（周四任务 ✅ + 待确认事项 2 条）
+- [x] 开发日志更新
+- [x] 项目目标文档更新（无需变更，接口定义单独立档：wiki《ProbeDB Hermes接口定义.md》）
+
+---
+
 ## 2026-08-26
 
 ### 完成

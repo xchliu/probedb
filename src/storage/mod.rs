@@ -199,7 +199,7 @@ impl StorageEngine {
     /// 序列化整个引擎状态为文本行协议（持久化用）
     ///
     /// 格式 v1:
-    /// ```
+    /// ```text
     /// # ProbeDB state v1
     /// SCHEMA|<table>|<col>:<type>|<col>:<type>...
     /// ROW|<table>|<row_id>|<value>|<value>...

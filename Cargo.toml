@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "AI内建数据库 — 从第一天就将AI作为一等公民的原生数据库"
 
+# rlib = Rust 内嵌（cargo 依赖）；cdylib = 跨语言 FFI（Python ctypes / C 调用）
+# 保持零外部依赖：FFI 层只用 std，编译离线可完成
+[lib]
+name = "probedb"
+crate-type = ["rlib", "cdylib"]
+
