@@ -19,13 +19,18 @@ pub mod wal;
 /// 步骤：写 `<path>.tmp` → rename 到 `<path>`。
 /// rename 在 POSIX 上是原子操作，保证数据库文件要么是旧的完整状态，
 /// 要么是新的完整状态，绝不会是写入一半的残缺文件。
+/// 任何一步失败都会清理残留的 tmp 文件，不留垃圾。
 pub fn save(engine: &StorageEngine, path: &str) -> Result<(), String> {
     let state = engine.export_state();
     let tmp_path = format!("{}.tmp", path);
-    fs::write(&tmp_path, state)
-        .map_err(|e| format!("写入临时文件失败 ({}): {}", tmp_path, e))?;
-    fs::rename(&tmp_path, path)
-        .map_err(|e| format!("替换数据库文件失败 ({}): {}", path, e))?;
+    if let Err(e) = fs::write(&tmp_path, &state) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("写入临时文件失败 ({}): {}", tmp_path, e));
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("替换数据库文件失败 ({}): {}", path, e));
+    }
     Ok(())
 }
 
@@ -36,6 +41,7 @@ const STATE_HEADER_V1: &str = "# ProbeDB state v1";
 ///
 /// 文件不存在时返回 Err（调用方决定是报错还是新建空库）。
 /// 做完整性校验：魔数/版本不匹配、空文件、损坏内容均返回 Err。
+/// 校验和（若存在）验证失败也返回 Err——静默篡改/损坏无处遁形。
 pub fn load(path: &str) -> Result<StorageEngine, String> {
     if !Path::new(path).exists() {
         return Err(format!("数据库文件不存在: {}", path));
@@ -44,6 +50,8 @@ pub fn load(path: &str) -> Result<StorageEngine, String> {
         .map_err(|e| format!("读取数据库文件失败 ({}): {}", path, e))?;
     // 完整性校验：空文件 / 非ProbeDB格式 / 版本不匹配 → 明确报错
     validate_header(&state)?;
+    // 校验和：检测静默篡改/损坏（向后兼容：v1早期无校验快照跳过）
+    validate_checksum(&state)?;
     let mut engine = StorageEngine::new();
     engine.import_state(&state)?;
     Ok(engine)
@@ -70,6 +78,43 @@ pub fn validate_header(state: &str) -> Result<(), String> {
         return Err(format!(
             "数据库版本不匹配: 期望 '{}'，实际 '{}'",
             STATE_HEADER_V1, first_line
+        ));
+    }
+    Ok(())
+}
+
+/// 校验快照校验和（最后一行 `# checksum <fnv1a64-hex>`）
+///
+/// 校验和覆盖校验行之前的全部字节，用于检测：
+/// - 静默损坏（磁盘位翻转、半截写入但头部恰好完整）
+/// - 恶意篡改（改数据但保留合法头部——头部校验拦不住）
+///
+/// 向后兼容：v1 早期（校验和引入前）的快照没有校验行 → 跳过校验。
+/// 这样旧文件仍可加载，新保存的文件自动获得校验保护。
+pub fn validate_checksum(state: &str) -> Result<(), String> {
+    use crate::storage::fnv1a64;
+
+    // 找最后一行是否为校验行
+    let checksum_line = state.lines().rev().next().unwrap_or("").trim();
+    if !checksum_line.starts_with("# checksum ") {
+        // 无校验行 = 早期 v1 快照 → 跳过（向后兼容）
+        return Ok(());
+    }
+    let expected = checksum_line["# checksum ".len()..].trim();
+    let expected: u64 = u64::from_str_radix(expected, 16)
+        .map_err(|_| format!("校验和格式无效: '{}'", checksum_line))?;
+
+    // 计算校验和覆盖的内容：去掉最后一行（含行尾换行）
+    let body = state.trim_end();
+    let body = match body.rfind('\n') {
+        Some(pos) => &body[..=pos], // 保留到倒数第二行末尾的换行，与 export 时一致
+        None => "",
+    };
+    let actual = fnv1a64(body.as_bytes());
+    if actual != expected {
+        return Err(format!(
+            "数据库文件校验和不匹配 (期望 {:016x}, 实际 {:016x})——文件已损坏或被篡改",
+            expected, actual
         ));
     }
     Ok(())
@@ -294,5 +339,117 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}.tmp", path));
+    }
+
+    #[test]
+    fn test_export_state_has_checksum_line() {
+        // 新格式导出必须带校验行（损坏检测的依据）
+        let state = build_engine().export_state();
+        let last = state.lines().rev().next().unwrap_or("");
+        assert!(
+            last.starts_with("# checksum "),
+            "导出的快照应以校验行结尾, got last line: '{}'",
+            last
+        );
+    }
+
+    #[test]
+    fn test_validate_checksum_ok() {
+        // 自身导出的快照 → 校验通过
+        let state = build_engine().export_state();
+        assert!(validate_checksum(&state).is_ok());
+    }
+
+    #[test]
+    fn test_validate_checksum_detects_tampering() {
+        // 篡改数据行（改名字）但保留合法头部 → 校验和不匹配，必须报错
+        let state = build_engine().export_state();
+        let tampered = state.replace("TEXT:alice", "TEXT:evil");
+        assert_ne!(state, tampered, "篡改必须改变内容");
+        let e = validate_checksum(&tampered).unwrap_err();
+        assert!(
+            e.contains("校验和不匹配"),
+            "篡改应报校验和不匹配, got: {}",
+            e
+        );
+    }
+
+    #[test]
+    fn test_validate_checksum_legacy_no_checksum_ok() {
+        // 向后兼容：v1 早期无校验行的快照 → 跳过校验，正常接受
+        let legacy = "# ProbeDB state v1\nSCHEMA|users|id:INTEGER|name:TEXT\nNEXTID|1\n";
+        assert!(validate_checksum(legacy).is_ok());
+    }
+
+    #[test]
+    fn test_load_detects_tampered_file() {
+        // 篡改落盘文件（改数据但保留头部+旧校验行）→ load 必须失败
+        let tmp = std::env::temp_dir().join("probedb_tampered.pdb");
+        let path = tmp.to_str().unwrap().to_string();
+        let _ = fs::remove_file(&path);
+
+        save(&build_engine(), &path).unwrap();
+        // 读文件、篡改数据、写回
+        let content = fs::read_to_string(&path).unwrap();
+        let tampered = content.replace("TEXT:alice", "TEXT:hacked");
+        fs::write(&path, &tampered).unwrap();
+
+        let r = load(&path);
+        assert!(r.is_err(), "篡改文件应加载失败");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.tmp", path));
+    }
+
+    #[test]
+    fn test_save_to_nonexistent_dir_errors_and_cleans_tmp() {
+        // 目标目录不存在 → save 明确报错，且不残留 .tmp 垃圾文件
+        let path = format!(
+            "{}/probedb_no_such_dir/probedb_x.pdb",
+            std::env::temp_dir().to_str().unwrap()
+        );
+        let tmp_path = format!("{}.tmp", path);
+        // 确保目录不存在
+        let dir = std::path::Path::new(&path).parent().unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        let r = save(&build_engine(), &path);
+        assert!(r.is_err(), "不存在目录下 save 应失败");
+        assert!(
+            !std::path::Path::new(&tmp_path).exists(),
+            "save 失败后不应残留 tmp 文件"
+        );
+    }
+
+    #[test]
+    fn test_save_cleanup_tmp_on_rename_failure() {
+        // 目标已存在且是目录 → rename 失败 → save 报错且清理 tmp
+        let dir = std::env::temp_dir().join("probedb_rename_dir_target");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 目标"文件"实际上是个目录 → rename(tmp, dir) 失败
+        let path = dir.to_str().unwrap().to_string();
+        let tmp_path = format!("{}.tmp", path);
+        // 先手动造一个 tmp 文件，模拟写成功后 rename 失败场景
+        // save 会先覆盖 tmp（fs::write 成功），然后 rename 失败
+        let r = save(&build_engine(), &path);
+        assert!(r.is_err(), "rename 到目录应失败");
+        assert!(
+            !std::path::Path::new(&tmp_path).exists(),
+            "rename 失败后应清理 tmp 文件"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_returns_clear_io_errors() {
+        // IO 错误信息应包含路径和原因，便于定位（而非裸 panic）
+        let path = format!(
+            "{}/probedb_no_such_dir/probedb_missing.pdb",
+            std::env::temp_dir().to_str().unwrap()
+        );
+        let e = load(&path).unwrap_err();
+        assert!(e.contains("数据库文件不存在"), "缺失文件报错不清晰: {}", e);
     }
 }

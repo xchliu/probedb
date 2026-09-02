@@ -204,8 +204,10 @@ impl StorageEngine {
     /// SCHEMA|<table>|<col>:<type>|<col>:<type>...
     /// ROW|<table>|<row_id>|<value>|<value>...
     /// NEXTID|<next_id>
+    /// # checksum <fnv1a64-hex>
     /// ```
     /// 显式类型标记 + 转义，保证 Text 含分隔符也能无损还原。
+    /// 尾部校验和覆盖除校验行外的全部内容，用于检测静默损坏/篡改。
     pub fn export_state(&self) -> String {
         let mut out = String::new();
         out.push_str("# ProbeDB state v1\n");
@@ -225,6 +227,8 @@ impl StorageEngine {
             }
         }
         out.push_str(&format!("NEXTID|{}\n", self.next_id));
+        let checksum = fnv1a64(out.as_bytes());
+        out.push_str(&format!("# checksum {:016x}\n", checksum));
         out
     }
 
@@ -376,6 +380,19 @@ pub(crate) fn decode_value(s: &str) -> Result<Value, String> {
             .map_err(|_| format!("向量元素解析失败: {}", s));
     }
     Err(format!("未知值编码: {}", s))
+}
+
+/// FNV-1a 64 位哈希（零外部依赖，用于快照校验和）
+///
+/// 不用于密码学，只用于检测意外损坏/静默篡改。
+/// 64 位碰撞概率足够低，满足数据完整性校验需求。
+pub(crate) fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    hash
 }
 
 /// 转义文本: \ → \\, | → \|, \n → \n, \r → \r
@@ -541,5 +558,46 @@ mod tests {
         } else {
             panic!("Expected Vector value");
         }
+    }
+
+    #[test]
+    fn test_fnv1a64_known_vector() {
+        // FNV-1a 64 参考值（零外部依赖的确定性校验）
+        // 空输入 = offset basis 本身
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        // "a" 的 FNV-1a 64 参考值（标准测试向量）
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn test_fnv1a64_changes_with_data() {
+        // 任何字节变化 → 哈希变化（篡改检测前提）
+        let a = fnv1a64(b"SELECT * FROM users WHERE age > 30");
+        let b = fnv1a64(b"SELECT * FROM users WHERE age > 31");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_export_state_checksum_is_stable() {
+        // 同一状态两次导出 → 校验行一致（确定性）
+        let s1 = build_storage_for_checksum().export_state();
+        let s2 = build_storage_for_checksum().export_state();
+        assert_eq!(s1, s2);
+        // 校验行在最后
+        assert!(s1.trim_end().ends_with(&format!(
+            "# checksum {:016x}",
+            fnv1a64(s1[..s1.rfind("# checksum").unwrap()].as_bytes())
+        )));
+    }
+
+    fn build_storage_for_checksum() -> StorageEngine {
+        let mut engine = StorageEngine::new();
+        engine.create_table(create_test_schema()).unwrap();
+        engine.insert("users", vec![
+            Value::Integer(1),
+            Value::Text("alice".to_string()),
+            Value::Integer(30),
+        ]).unwrap();
+        engine
     }
 }

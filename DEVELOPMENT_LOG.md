@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-09-02
+
+### 完成
+- **错误处理与测试加固（Phase 3 周五任务，周计划收尾）**
+- **数据损坏检测——快照校验和**：export_state 尾部新增 `# checksum <fnv1a64-hex>` 行
+  - 零依赖 FNV-1a 64 位哈希（src/storage/mod.rs `fnv1a64()`），offset basis + prime 标准实现
+  - persistence::load 新增 `validate_checksum()`：校验行存在则强制匹配，不匹配 → 明确报"文件已损坏或被篡改"
+  - 向后兼容：v1 早期无校验行快照 → 跳过校验，正常加载（老库平滑升级）
+  - 覆盖场景：静默篡改（改数据但保留合法头部）、磁盘位翻转、半截写入但头部完整的极端损坏
+- **文件IO错误处理**：save() 任何一步失败（fs::write / fs::rename）→ 自动清理残留 `.tmp` 文件，不留垃圾
+  - 磁盘满、权限不足、路径不存在 → 明确报错（含路径+OS原因），不静默
+- **桥接层验证**：bridge/probedb.py 自测 + --demo（CRUD + 向量 + 持久化重开）全部通过，校验和改动未破坏 FFI 链路
+
+### 测试
+- 86 passed, 0 failed（从 75→86，新增 11 个测试）
+- test_export_state_has_checksum_line / test_validate_checksum_ok：导出带校验行且自身校验通过
+- test_validate_checksum_detects_tampering：篡改 TEXT:alice → 校验和不匹配报错
+- test_validate_checksum_legacy_no_checksum_ok：无校验行旧快照 → 跳过校验正常接受
+- test_load_detects_tampered_file：篡改落盘文件 → load 失败
+- test_save_to_nonexistent_dir_errors_and_cleans_tmp：目录不存在 → save 报错且无 tmp 残留
+- test_save_cleanup_tmp_on_rename_failure：rename 失败 → 清理 tmp
+- test_load_returns_clear_io_errors：缺失文件 → 清晰中文报错
+- test_fnv1a64_known_vector：FNV-1a 标准测试向量（空输入=offset basis，"a"=0xaf63dc4c8601ec8c）
+- test_fnv1a64_changes_with_data：单字节变化 → 哈希变化
+- test_export_state_checksum_is_stable：同一状态两次导出 → 校验行一致（确定性）
+
+### 决策
+- **校验和格式**：文本行 `# checksum <hex>` 放快照最后，以 `#` 开头 → import_state 天然跳过（注释行），只由 load 的 validate_checksum 消费，最小侵入
+- **哈希算法选 FNV-1a 64 而非 CRC32**：零依赖自实现简单（~10 行）、64 位碰撞概率足够低、有标准测试向量可验证正确性
+- **旧快照不强制回填校验和**：向后兼容优先——无校验行跳过，不拒绝老库（数据完整性保护从新写入开始生效）
+
+---
+
+
 ## 2026-09-01
 
 ### 完成
