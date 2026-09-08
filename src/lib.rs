@@ -638,11 +638,15 @@ mod tests {
             "[perf] 1000条INSERT 内存模式: {:?} | 同步模式: {:?} | 批量模式: {:?} | 恢复: {:?}",
             mem_elapsed, sync_elapsed, batch_elapsed, load_elapsed
         );
+        // 容差 20%：批量模式理论上优于同步模式，但磁盘 I/O 抖动可能偶发反转，
+        // 用相对容差而非硬性 <= 避免 flaky test（历史上 batch 快 26%，容差留足余量）
+        let tolerance = sync_elapsed * 12 / 10; // sync * 1.2
         assert!(
-            batch_elapsed <= sync_elapsed,
-            "批量模式应不慢于同步模式（sync={:?} batch={:?}）",
+            batch_elapsed <= tolerance,
+            "批量模式应不慢于同步模式×1.2（sync={:?} batch={:?} tolerance={:?}）",
             sync_elapsed,
-            batch_elapsed
+            batch_elapsed,
+            tolerance
         );
 
         for p in [&sync_path, &batch_path] {
