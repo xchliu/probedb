@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-09-09
+
+### 完成
+- **SELECT 列投影**：`SELECT col1, col2 FROM t` 现在只返回指定列（之前 executor 丢弃 columns 参数，始终返回所有列）
+  - `SELECT *` 显式返回所有列（行为不变但语义明确化）
+  - `SELECT name FROM t` 只返回 name 列，不含未选择的列
+  - 查询不存在的列现在报明确错误（`列 'ghost' 不存在`）
+- **COUNT(*) 聚合**：`SELECT COUNT(*) FROM t` 返回单行单列（列名 `count`），支持 `WHERE` 过滤
+- **INSERT 返回值修复**：单行 INSERT 返回 `ExecuteResult::Inserted { row_id }`（之前始终返回 Message，导致 `Inserted` variant 从未被构造——dead code warning）
+  - 多行 INSERT 仍返回 `ExecuteResult::Message("插入 N 行数据")`
+- 修复 4 个持久化测试用例：旧测试用 `SELECT id FROM` 但断言结果含 `name` 列的值，列投影后需改为 `SELECT id, name FROM`
+
+### 测试
+- 92 passed, 0 failed
+- 新增 6 测试：test_select_star_all_columns, test_select_single_column_projection, test_select_multi_column_projection, test_select_nonexistent_column_errors, test_count_star, test_insert_returns_row_id
+- 86 → 92 全绿
+
+### 决策
+- 列投影是基础 SQL 功能缺失，不影响 Hermes 接入战略决策，自主推进
+- COUNT(*) 在 executor 层短路返回（WHERE 过滤后直接计数），不走列投影路径
+- 单行 vs 多行 INSERT 的返回值区分：单行返回 row_id（调用方可能需要），多行返回行数摘要
+
+### 文档更新
+- [x] 开发日志更新
+- [ ] 周计划更新（本周无新计划，继续推进待确认事项）
+
+---
+
 ## 2026-09-08
 
 ### 完成
