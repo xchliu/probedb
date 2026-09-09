@@ -312,7 +312,7 @@ mod tests {
 
             // next_id 恢复正确：继续插入得到 id=3
             assert!(db.execute("INSERT INTO users (id, name, age) VALUES (3, 'charlie', 35)").is_ok());
-            let r2 = db.execute("SELECT id FROM users WHERE id = 3").unwrap();
+            let r2 = db.execute("SELECT id, name FROM users WHERE id = 3").unwrap();
             assert!(r2.contains("charlie"));
             db.persist().unwrap();
         }
@@ -483,7 +483,7 @@ mod tests {
 
         // 重启：只有基准数据
         let mut db = ProbeDB::open(&path).unwrap();
-        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        let r = db.execute("SELECT id, name FROM t ORDER BY id ASC").unwrap();
         assert!(r.contains("1 行"), "未flush的2行应丢失，只剩基准1行");
         assert!(r.contains("base"));
 
@@ -523,7 +523,7 @@ mod tests {
 
         // 重启：WAL 重放恢复 flush 的数据
         let mut db = ProbeDB::open(&path).unwrap();
-        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        let r = db.execute("SELECT id, name FROM t ORDER BY id ASC").unwrap();
         assert!(r.contains("3 行"), "flush的2行+基准1行 = 3行");
         assert!(r.contains("kept1"));
         assert!(r.contains("kept2"));
@@ -558,7 +558,7 @@ mod tests {
 
         // 重启：数据完整
         let mut db = ProbeDB::open(&path).unwrap();
-        let r = db.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        let r = db.execute("SELECT id, name FROM t ORDER BY id ASC").unwrap();
         assert!(r.contains("2 行"), "批量数据应完整持久化");
         assert!(r.contains("a"));
         assert!(r.contains("b"));

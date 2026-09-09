@@ -90,14 +90,19 @@ impl Executor {
                 }).collect();
                 let all_parsed = rows_parsed?;
                 let count = all_parsed.len();
+                let mut last_row_id = 0u64;
                 for row in all_parsed {
                     // WAL 先写（I 记录，显式 row_id），成功后改内存
                     let row_id = self.engine.next_id();
                     let vals: Vec<String> = row.iter().map(crate::storage::encode_value).collect();
                     self.append_wal(&format!("I|{}|{}|{}", table_name, row_id, vals.join("|")))?;
-                    self.engine.insert(&table_name, row)?;
+                    last_row_id = self.engine.insert(&table_name, row)?;
                 }
-                Ok(ExecuteResult::Message(format!("插入 {} 行数据", count)))
+                if count == 1 {
+                    Ok(ExecuteResult::Inserted { row_id: last_row_id })
+                } else {
+                    Ok(ExecuteResult::Message(format!("插入 {} 行数据", count)))
+                }
             }
 
             SQLStatement::Delete { table_name, where_clause } => {
@@ -153,9 +158,9 @@ impl Executor {
                 })
             }
 
-            SQLStatement::Select { table_name, columns: _, where_clause, order_by, limit } => {
+            SQLStatement::Select { table_name, columns, where_clause, order_by, limit } => {
                 let schema = self.engine.get_schema(&table_name)?;
-                let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                let all_col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
                 // 扫描全表
                 let rows = self.engine.scan_table(&table_name)?.clone();
@@ -179,17 +184,58 @@ impl Executor {
                 }
 
                 // 提取原始行（过滤后的）
-                let mut matched: Vec<Row> = scored_rows.iter().map(|(r, _)| r.clone()).collect();
+                let matched: Vec<Row> = scored_rows.iter().map(|(r, _)| r.clone()).collect();
 
-                // 构建列名索引
-                let col_indices: Vec<usize> = schema.columns.iter().map(|c| c.index).collect();
+                // ===== 列投影解析 =====
+                // SELECT *          → 所有列
+                // SELECT col1, col2 → 仅指定列
+                // SELECT COUNT(*)   → 聚合，返回单行单列
+                let upper_cols: Vec<String> = columns.iter()
+                    .map(|c| c.trim().to_uppercase()).collect();
+
+                // COUNT(*) 聚合
+                if upper_cols.len() == 1 && (upper_cols[0] == "COUNT(*)" || upper_cols[0] == "COUNT (*)") {
+                    let count = matched.len();
+                    return Ok(ExecuteResult::SelectResult {
+                        columns: vec!["count".to_string()],
+                        rows: vec![vec![count.to_string()]],
+                    });
+                }
+
+                // 解析列投影（* 或具体列名）
+                let proj_indices: Vec<usize>;
+                let proj_names: Vec<String>;
+                if columns.len() == 1 && columns[0] == "*" {
+                    proj_indices = schema.columns.iter().map(|c| c.index).collect();
+                    proj_names = all_col_names.clone();
+                } else {
+                    let mut idxs = Vec::new();
+                    let mut names = Vec::new();
+                    for col_name in &columns {
+                        let col_name = col_name.trim();
+                        if col_name == "*" {
+                            // 混合 SELECT *, name — 展开所有列
+                            for ci in &schema.columns {
+                                idxs.push(ci.index);
+                                names.push(ci.name.clone());
+                            }
+                        } else {
+                            let ci = schema.columns.iter().find(|c| c.name == *col_name)
+                                .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+                            idxs.push(ci.index);
+                            names.push(ci.name.clone());
+                        }
+                    }
+                    proj_indices = idxs;
+                    proj_names = names;
+                }
 
                 // ORDER BY
                 let mut sorted: Vec<Row> = if let Some(ref order_by_str) = order_by {
                     let (order_col, descending) = parse_order_by_str(order_by_str);
 
                     // 检查是否是 vector_similarity 排序
-                    if let Some(ref vs) = vector_sim_order {
+                    if let Some(ref _vs) = vector_sim_order {
                         // 用预先计算的相似度排序
                         scored_rows.sort_by(|a, b| {
                             let sa = a.1.unwrap_or(0.0);
@@ -205,9 +251,9 @@ impl Executor {
                     matched
                 };
 
-                // 转换行为字符串
+                // 转换行为字符串（仅投影列）
                 let mut result_rows: Vec<Vec<String>> = sorted.iter().map(|row| {
-                    col_indices.iter().map(|&i| {
+                    proj_indices.iter().map(|&i| {
                         if i < row.values.len() {
                             row.values[i].to_string()
                         } else {
@@ -225,7 +271,7 @@ impl Executor {
                 }
 
                 Ok(ExecuteResult::SelectResult {
-                    columns: col_names,
+                    columns: proj_names,
                     rows: result_rows,
                 })
             }
@@ -1137,5 +1183,148 @@ mod tests {
             mixed_elapsed,
             mixed_elapsed.as_micros() as f64 / 10000.0
         );
+    }
+
+    // ===== 列投影 + COUNT(*) 测试 =====
+
+    #[test]
+    fn test_select_star_all_columns() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("SELECT * FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns.len(), 3, "SELECT * 应返回所有3列");
+                assert_eq!(columns[0], "id");
+                assert_eq!(columns[1], "name");
+                assert_eq!(columns[2], "age");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], "1");
+                assert_eq!(rows[0][1], "alice");
+                assert_eq!(rows[0][2], "30");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_single_column_projection() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (2, 'bob', 25)").unwrap()).unwrap();
+
+        // SELECT name — 只返回 name 列
+        let results = executor.execute(parse_sql("SELECT name FROM t ORDER BY id ASC").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns.len(), 1, "SELECT name 应只返回1列");
+                assert_eq!(columns[0], "name");
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], "alice");
+                assert_eq!(rows[1][0], "bob");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_multi_column_projection() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)").unwrap()).unwrap();
+
+        // SELECT id, name — 只返回2列（不含 age）
+        let results = executor.execute(parse_sql("SELECT id, name FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns.len(), 2, "SELECT id, name 应返回2列");
+                assert_eq!(columns[0], "id");
+                assert_eq!(columns[1], "name");
+                assert_eq!(rows[0].len(), 2, "每行应有2个值");
+                assert_eq!(rows[0][0], "1");
+                assert_eq!(rows[0][1], "alice");
+                // 不应包含 age 值 "30"
+                assert!(!rows[0].contains(&"30".to_string()), "不应包含未选择的列");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_nonexistent_column_errors() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+
+        // SELECT 不存在的列 → 报错
+        let result = executor.execute(parse_sql("SELECT id, ghost FROM t").unwrap());
+        assert!(result.is_err(), "查询不存在的列应报错");
+        assert!(result.unwrap_err().contains("ghost"), "错误应提到列名 ghost");
+    }
+
+    #[test]
+    fn test_count_star() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'b')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (3, 'c')").unwrap()).unwrap();
+
+        // COUNT(*) 全表
+        let results = executor.execute(parse_sql("SELECT COUNT(*) FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["count".to_string()], "COUNT(*) 列名应为 count");
+                assert_eq!(rows.len(), 1, "COUNT 应返回单行");
+                assert_eq!(rows[0][0], "3", "COUNT(*) 应返回3");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // COUNT(*) with WHERE
+        let results = executor.execute(parse_sql("SELECT COUNT(*) FROM t WHERE id > 1").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "2", "COUNT(*) WHERE id > 1 应返回2");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // COUNT(*) 空表
+        executor.execute(parse_sql("CREATE TABLE empty (id INTEGER)").unwrap()).unwrap();
+        let results = executor.execute(parse_sql("SELECT COUNT(*) FROM empty").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "0", "COUNT(*) 空表应返回0");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_insert_returns_row_id() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+
+        // 单行 INSERT 应返回 Inserted { row_id }
+        let results = executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::Inserted { row_id } => {
+                assert!(*row_id > 0, "单行插入应返回有效 row_id");
+            }
+            _ => panic!("Expected Inserted for single-row INSERT"),
+        }
+
+        // 多行 INSERT 应返回 Message（带行数）
+        let results = executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'bob'), (3, 'charlie')").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::Message(msg) => {
+                assert!(msg.contains("2"), "多行插入消息应含行数: {}", msg);
+            }
+            _ => panic!("Expected Message for multi-row INSERT"),
+        }
     }
 }
