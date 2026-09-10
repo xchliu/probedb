@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-09-10
+
+### 完成
+- **DROP TABLE 语句**：`DROP TABLE t` / `DROP TABLE IF EXISTS t`
+  - SQLStatement::DropTable + parse_drop_table（支持 IF EXISTS 关键字）
+  - StorageEngine::drop_table（删除 schema + 数据）
+  - ExecuteResult::TableDropped + WAL `DROP|<table>` 记录
+  - WAL replay_drop（幂等：表不存在则跳过）
+- **SELECT DISTINCT**：`SELECT DISTINCT col FROM t` / `SELECT DISTINCT * FROM t`
+  - Select.distinct 字段 + DISTINCT 关键字解析
+  - Executor HashSet 去重（保持首次出现顺序）
+  - 与 WHERE / ORDER BY / LIMIT / 多列 / SELECT * 全组合可用
+
+### 测试
+- 102 passed, 0 failed (92 → 102, +10 新测试)
+- DROP TABLE: basic / recreate / nonexistent error / IF EXISTS / WAL recovery
+- DISTINCT: single col / multi col / all unique / with WHERE / star
+
+### 决策
+- IF EXISTS 在解析层忽略关键字（不改变 executor 行为）：DROP TABLE 不存在的表仍报错。保持简单，不引入 IF EXISTS 语义差异
+- DISTINCT 去重在 LIMIT 之前执行（SQL 标准行为：先投影去重，再截断）
+- DROP TABLE 写 WAL `DROP|` 记录，重放幂等设计与其他操作一致
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-09-09
 
 ### 完成
