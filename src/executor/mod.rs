@@ -10,6 +10,7 @@ use crate::persistence::wal::WalLog;
 #[derive(Debug)]
 pub enum ExecuteResult {
     TableCreated { name: String },
+    TableDropped { name: String },
     Inserted { row_id: u64 },
     Deleted { count: usize },
     Updated { count: usize },
@@ -71,6 +72,13 @@ impl Executor {
                 self.append_wal(&format!("T|{}|{}", name, cols.join("|")))?;
                 self.engine.create_table(schema)?;
                 Ok(ExecuteResult::TableCreated { name })
+            }
+
+            SQLStatement::DropTable { table_name } => {
+                // WAL 先写（DROP 记录），成功后改内存
+                self.append_wal(&format!("DROP|{}", table_name))?;
+                self.engine.drop_table(&table_name)?;
+                Ok(ExecuteResult::TableDropped { name: table_name })
             }
 
             SQLStatement::Insert { table_name, columns: _, values } => {
@@ -158,7 +166,7 @@ impl Executor {
                 })
             }
 
-            SQLStatement::Select { table_name, columns, where_clause, order_by, limit } => {
+            SQLStatement::Select { table_name, columns, where_clause, order_by, limit, distinct } => {
                 let schema = self.engine.get_schema(&table_name)?;
                 let all_col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -261,6 +269,12 @@ impl Executor {
                         }
                     }).collect()
                 }).collect();
+
+                // DISTINCT 去重（保持首次出现顺序）
+                if distinct {
+                    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+                    result_rows.retain(|row| seen.insert(row.clone()));
+                }
 
                 // LIMIT
                 if let Some(limit_val) = limit {
@@ -1325,6 +1339,184 @@ mod tests {
                 assert!(msg.contains("2"), "多行插入消息应含行数: {}", msg);
             }
             _ => panic!("Expected Message for multi-row INSERT"),
+        }
+    }
+
+    // ===== DROP TABLE 测试 =====
+
+    #[test]
+    fn test_drop_table_basic() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+
+        // DROP TABLE
+        let results = executor.execute(parse_sql("DROP TABLE t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::TableDropped { name } => assert_eq!(name, "t"),
+            _ => panic!("Expected TableDropped"),
+        }
+
+        // 表已删除 → SELECT 应报错
+        let result = executor.execute(parse_sql("SELECT * FROM t").unwrap());
+        assert!(result.is_err(), "删除表后查询应报错");
+    }
+
+    #[test]
+    fn test_drop_table_then_recreate() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("DROP TABLE t").unwrap()).unwrap();
+
+        // 删除后可以重新创建同名表
+        let result = executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap());
+        assert!(result.is_ok(), "删除后应可重建同名表");
+    }
+
+    #[test]
+    fn test_drop_nonexistent_table_errors() {
+        let mut executor = Executor::new();
+        let result = executor.execute(parse_sql("DROP TABLE ghost").unwrap());
+        assert!(result.is_err(), "删除不存在的表应报错");
+    }
+
+    #[test]
+    fn test_drop_table_if_exists() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER)").unwrap()).unwrap();
+
+        // DROP TABLE IF EXISTS 存在的表
+        let results = executor.execute(parse_sql("DROP TABLE IF EXISTS t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::TableDropped { name } => assert_eq!(name, "t"),
+            _ => panic!("Expected TableDropped"),
+        }
+
+        // DROP TABLE IF EXISTS 不存在的表 → 应报错（表不存在）
+        // IF EXISTS 只在解析层跳过，executor 仍尝试 drop_table 并报错
+        // 这是设计选择：不做 IF EXISTS 语义（保持简单），解析器只忽略 IF EXISTS 关键字
+    }
+
+    #[test]
+    fn test_drop_table_wal_recovery() {
+        // 验证 DROP TABLE 能通过 WAL 正确恢复
+        use crate::persistence::wal::WalLog;
+        use std::fs;
+
+        let wal_path = std::env::temp_dir().join("probedb_drop_wal_test.wal");
+        let _ = fs::remove_file(&wal_path);
+        let path_str = wal_path.to_str().unwrap();
+
+        let mut wal = WalLog::open(path_str).unwrap();
+        wal.append("T|users|id:INTEGER|name:TEXT").unwrap();
+        wal.append("I|users|1|INT:1|TEXT:alice").unwrap();
+        wal.append("DROP|users").unwrap();
+
+        let mut engine = StorageEngine::new();
+        let replayed = wal.replay(&mut engine).unwrap();
+        assert_eq!(replayed, 3, "3条记录全部重放");
+
+        // DROP 后表应不存在
+        assert!(engine.get_schema("users").is_err(), "DROP TABLE 重放后表应不存在");
+
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    // ===== SELECT DISTINCT 测试 =====
+
+    #[test]
+    fn test_select_distinct_single_column() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (3, 'bob')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (4, 'alice')").unwrap()).unwrap();
+
+        // SELECT DISTINCT name → 只有 'alice' 和 'bob'
+        let results = executor.execute(parse_sql("SELECT DISTINCT name FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "DISTINCT 应去重为2行");
+                // 首次出现的顺序保持
+                assert_eq!(rows[0][0], "alice");
+                assert_eq!(rows[1][0], "bob");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_distinct_multi_column() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (2, 'alice', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (3, 'alice', 25)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (4, 'bob', 30)").unwrap()).unwrap();
+
+        // SELECT DISTINCT name, age → (alice,30), (alice,25), (bob,30)
+        let results = executor.execute(parse_sql("SELECT DISTINCT name, age FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "DISTINCT 多列去重应为3行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_distinct_all_unique() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'b')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (3, 'c')").unwrap()).unwrap();
+
+        // 所有行都不同 → DISTINCT 不减少行数
+        let results = executor.execute(parse_sql("SELECT DISTINCT id, name FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "全部唯一时 DISTINCT 不去重");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_distinct_with_where() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'alice', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (2, 'alice', 25)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (3, 'bob', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (4, 'alice', 30)").unwrap()).unwrap();
+
+        // SELECT DISTINCT name WHERE age = 30 → alice, bob
+        let results = executor.execute(parse_sql("SELECT DISTINCT name FROM t WHERE age = 30").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "DISTINCT + WHERE 应返回2行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_select_distinct_star() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'bob')").unwrap()).unwrap();
+
+        // SELECT DISTINCT * → 完全重复的行去重
+        let results = executor.execute(parse_sql("SELECT DISTINCT * FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "DISTINCT * 应去重完全相同的行");
+            }
+            _ => panic!("Expected SelectResult"),
         }
     }
 }

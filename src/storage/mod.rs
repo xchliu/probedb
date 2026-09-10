@@ -110,6 +110,18 @@ impl StorageEngine {
         self.schemas.keys().cloned().collect()
     }
 
+    /// 删除表（schema + 数据）
+    ///
+    /// 表不存在 → Err。删除后表名可重新 CREATE TABLE。
+    pub fn drop_table(&mut self, table_name: &str) -> Result<(), String> {
+        if !self.schemas.contains_key(table_name) {
+            return Err(format!("表 '{}' 不存在", table_name));
+        }
+        self.schemas.remove(table_name);
+        self.data.remove(table_name);
+        Ok(())
+    }
+
     /// 按ID列表删除行
     pub fn delete_by_ids(&mut self, table_name: &str, ids: &[u64]) -> Result<usize, String> {
         let table_name_str = table_name.to_string();

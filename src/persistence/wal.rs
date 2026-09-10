@@ -157,6 +157,7 @@ impl WalLog {
                 "I" => replay_insert(engine, &parts),
                 "D" => replay_delete(engine, &parts),
                 "U" => replay_update(engine, &parts),
+                "DROP" => replay_drop(engine, &parts),
                 other => Err(format!("未知WAL操作码: {}", other)),
             };
             match result {
@@ -268,6 +269,20 @@ fn replay_update(engine: &mut StorageEngine, parts: &[&str]) -> Result<(), Strin
         .map_err(|_| format!("col_index解析失败: {}", parts[3]))?;
     let value = storage::decode_value(parts[4])?;
     engine.update_by_ids(&table, &[id], col_index, value)?;
+    Ok(())
+}
+
+/// 重放 DROP TABLE（幂等：表不存在则跳过）
+fn replay_drop(engine: &mut StorageEngine, parts: &[&str]) -> Result<(), String> {
+    if parts.len() < 2 {
+        return Err("字段不足".to_string());
+    }
+    let table = parts[1].to_string();
+    // 表不存在 → 幂等跳过（可能已被快照固化后再次重放）
+    if engine.get_schema(&table).is_err() {
+        return Ok(());
+    }
+    engine.drop_table(&table)?;
     Ok(())
 }
 

@@ -21,6 +21,7 @@ pub enum SQLStatement {
         where_clause: Option<String>,
         order_by: Option<String>,
         limit: Option<u64>,
+        distinct: bool,
     },
     Delete {
         table_name: String,
@@ -30,6 +31,9 @@ pub enum SQLStatement {
         table_name: String,
         assignments: Vec<(String, String)>, // (column_name, new_value_expr)
         where_clause: Option<String>,
+    },
+    DropTable {
+        table_name: String,
     },
 }
 
@@ -74,6 +78,8 @@ fn parse_one(sql: &str) -> Result<SQLStatement, String> {
         parse_delete(sql)
     } else if upper.starts_with("UPDATE ") {
         parse_update(sql)
+    } else if upper.starts_with("DROP TABLE ") {
+        parse_drop_table(sql)
     } else {
         Err(format!("不支持的SQL语句: {}", sql))
     }
@@ -240,6 +246,17 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let from_pos = rest.to_uppercase().find(" FROM ")
         .ok_or_else(|| "缺少FROM子句".to_string())?;
     let columns_str = &rest[..from_pos];
+
+    // 检查 DISTINCT 关键字
+    let (distinct, columns_str) = {
+        let trimmed = columns_str.trim();
+        if trimmed.to_uppercase().starts_with("DISTINCT ") {
+            (true, trimmed[9..].trim())
+        } else {
+            (false, trimmed)
+        }
+    };
+
     let columns: Vec<String> = columns_str.split(',')
         .map(|s| s.trim().to_lowercase())
         .collect();
@@ -321,6 +338,7 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         where_clause,
         order_by,
         limit,
+        distinct,
     })
 }
 
@@ -414,6 +432,30 @@ fn parse_update(sql: &str) -> Result<SQLStatement, String> {
         assignments,
         where_clause,
     })
+}
+
+/// 解析 DROP TABLE 语句
+/// DROP TABLE table_name
+fn parse_drop_table(sql: &str) -> Result<SQLStatement, String> {
+    let s = sql.trim();
+    let rest = s.strip_prefix("DROP TABLE ")
+        .or_else(|| s.strip_prefix("drop table "))
+        .ok_or_else(|| "无法解析DROP TABLE".to_string())?
+        .trim();
+
+    // 支持 IF EXISTS 可选子句
+    let rest = if rest.to_uppercase().starts_with("IF EXISTS ") {
+        rest[10..].trim()
+    } else {
+        rest
+    };
+
+    if rest.is_empty() {
+        return Err("DROP TABLE 缺少表名".to_string());
+    }
+
+    let table_name = rest.split_whitespace().next().unwrap().to_lowercase();
+    Ok(SQLStatement::DropTable { table_name })
 }
 
 // ========== 辅助函数 ==========

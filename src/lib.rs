@@ -118,6 +118,9 @@ impl ProbeDB {
                 executor::ExecuteResult::TableCreated { name } => {
                     output.push(format!("表 '{}' 创建成功", name));
                 }
+                executor::ExecuteResult::TableDropped { name } => {
+                    output.push(format!("表 '{}' 已删除", name));
+                }
                 executor::ExecuteResult::Inserted { row_id } => {
                     output.push(format!("插入成功，行ID: {}", row_id));
                 }
