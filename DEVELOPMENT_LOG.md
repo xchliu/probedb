@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-09-11
+
+### 完成
+- **聚合函数 SUM/AVG/MIN/MAX**：`SELECT SUM(col) FROM t`
+  - AggFunc 枚举 + parse_aggregate/extract_agg_column 辅助函数
+  - 执行器提取数值列（Integer→f64, Float→f64），计算聚合值
+  - 整数列返回整数格式（除 AVG 返回浮点），空表返回 0
+  - 与 WHERE 过滤组合可用
+- **OFFSET 分页**：`SELECT * FROM t OFFSET 2` / `SELECT * FROM t LIMIT 3 OFFSET 5`
+  - SQLStatement::Select.offset 字段
+  - parse_select 解析 OFFSET（独立使用或跟在 LIMIT 后）
+  - ORDER BY 结束位置检测同时找 LIMIT 和 OFFSET
+  - 执行器在 DISTINCT 之后、LIMIT 之前应用 OFFSET
+
+### 测试
+- 110 passed, 0 failed
+- 新增测试: test_sum_aggregate, test_avg_aggregate, test_min_max_aggregate, test_aggregate_with_where, test_aggregate_empty_table, test_offset_basic, test_limit_with_offset, test_offset_exceeds_count
+
+### 决策
+- 聚合函数仅支持单列输入（SUM(col)），不支持 SUM(a+b) 表达式
+- 整数列 SUM/MIN/MAX 返回整数格式，AVG 始终返回浮点
+- OFFSET 在 DISTINCT 之后应用（先去重再跳过）
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-09-10
 
 ### 完成
