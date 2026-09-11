@@ -3,6 +3,7 @@
 use crate::sql::SQLStatement;
 use crate::storage::*;
 use crate::types::Value;
+use crate::types::DataType;
 use crate::types::cosine_similarity;
 use crate::persistence::wal::WalLog;
 
@@ -166,7 +167,7 @@ impl Executor {
                 })
             }
 
-            SQLStatement::Select { table_name, columns, where_clause, order_by, limit, distinct } => {
+            SQLStatement::Select { table_name, columns, where_clause, order_by, limit, offset, distinct } => {
                 let schema = self.engine.get_schema(&table_name)?;
                 let all_col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -208,6 +209,59 @@ impl Executor {
                         columns: vec!["count".to_string()],
                         rows: vec![vec![count.to_string()]],
                     });
+                }
+
+                // SUM/AVG/MIN/MAX 聚合（单列）
+                if upper_cols.len() == 1 {
+                    let col_trimmed = columns[0].trim();
+                    let upper = col_trimmed.to_uppercase();
+                    let agg = parse_aggregate(&upper);
+                    if let Some(agg_fn) = agg {
+                        let inner_col = extract_agg_column(&upper);
+                        let col_name = inner_col.trim().to_lowercase();
+                        let ci = schema.columns.iter().find(|c| c.name == col_name)
+                            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+
+                        let mut nums: Vec<f64> = Vec::new();
+                        for row in &matched {
+                            if let Some(v) = row.values.get(ci.index) {
+                                match v {
+                                    Value::Integer(n) => nums.push(*n as f64),
+                                    Value::Float(f) => nums.push(*f),
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let (agg_name, agg_value) = match agg_fn {
+                            AggFunc::Sum => ("sum", nums.iter().sum::<f64>()),
+                            AggFunc::Avg => {
+                                if nums.is_empty() { ("avg", 0.0) }
+                                else { ("avg", nums.iter().sum::<f64>() / nums.len() as f64) }
+                            }
+                            AggFunc::Min => {
+                                if nums.is_empty() { ("min", 0.0) }
+                                else { ("min", nums.iter().cloned().fold(f64::INFINITY, f64::min)) }
+                            }
+                            AggFunc::Max => {
+                                if nums.is_empty() { ("max", 0.0) }
+                                else { ("max", nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) }
+                            }
+                        };
+
+                        let value_str = if agg_value == agg_value.trunc()
+                            && ci.data_type == DataType::Integer && agg_fn != AggFunc::Avg
+                        {
+                            format!("{}", agg_value as i64)
+                        } else {
+                            format!("{}", agg_value)
+                        };
+
+                        return Ok(ExecuteResult::SelectResult {
+                            columns: vec![agg_name.to_string()],
+                            rows: vec![vec![value_str]],
+                        });
+                    }
                 }
 
                 // 解析列投影（* 或具体列名）
@@ -276,6 +330,16 @@ impl Executor {
                     result_rows.retain(|row| seen.insert(row.clone()));
                 }
 
+                // OFFSET — 跳过前 N 行（在 DISTINCT 之后、LIMIT 之前）
+                if let Some(offset_val) = offset {
+                    let o = offset_val as usize;
+                    if o < result_rows.len() {
+                        result_rows.drain(0..o);
+                    } else {
+                        result_rows.clear();
+                    }
+                }
+
                 // LIMIT
                 if let Some(limit_val) = limit {
                     let l = limit_val as usize;
@@ -291,6 +355,46 @@ impl Executor {
             }
         }
     }
+}
+
+// ===== 聚合函数支持 =====
+
+/// 聚合函数类型
+#[derive(PartialEq)]
+enum AggFunc {
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// 检测字符串是否是聚合函数调用（SUM(col), AVG(col), MIN(col), MAX(col)）
+fn parse_aggregate(s: &str) -> Option<AggFunc> {
+    let s = s.trim();
+    if s.to_uppercase().starts_with("SUM(") && s.ends_with(')') {
+        return Some(AggFunc::Sum);
+    }
+    if s.to_uppercase().starts_with("AVG(") && s.ends_with(')') {
+        return Some(AggFunc::Avg);
+    }
+    if s.to_uppercase().starts_with("MIN(") && s.ends_with(')') {
+        return Some(AggFunc::Min);
+    }
+    if s.to_uppercase().starts_with("MAX(") && s.ends_with(')') {
+        return Some(AggFunc::Max);
+    }
+    None
+}
+
+/// 从聚合函数调用中提取列名（如 "SUM(age)" → "age"）
+fn extract_agg_column(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(paren_start) = s.find('(') {
+        if let Some(paren_end) = s.rfind(')') {
+            return &s[paren_start + 1..paren_end];
+        }
+    }
+    s
 }
 
 // ===== 向量相似度原生函数支持 =====
@@ -1515,6 +1619,165 @@ mod tests {
         match &results[0] {
             ExecuteResult::SelectResult { rows, .. } => {
                 assert_eq!(rows.len(), 2, "DISTINCT * 应去重完全相同的行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== 聚合函数测试 =====
+
+    #[test]
+    fn test_sum_aggregate() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, price INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, price) VALUES (1, 'a', 10)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, price) VALUES (2, 'b', 20)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, price) VALUES (3, 'c', 30)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("SELECT SUM(price) FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["sum".to_string()]);
+                assert_eq!(rows[0][0], "60", "SUM(price) 应为 60");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_avg_aggregate() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'a', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (2, 'b', 25)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (3, 'c', 35)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("SELECT AVG(age) FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["avg".to_string()]);
+                let avg: f64 = rows[0][0].parse().unwrap();
+                assert!((avg - 30.0).abs() < 0.01, "AVG(age) 应为 30，得到 {}", avg);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_min_max_aggregate() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, score INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, score) VALUES (1, 'a', 50)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, score) VALUES (2, 'b', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, score) VALUES (3, 'c', 70)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("SELECT MIN(score) FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["min".to_string()]);
+                assert_eq!(rows[0][0], "50", "MIN(score) 应为 50");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let results = executor.execute(parse_sql("SELECT MAX(score) FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["max".to_string()]);
+                assert_eq!(rows[0][0], "90", "MAX(score) 应为 90");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_aggregate_with_where() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (1, 'a', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (2, 'b', 25)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name, age) VALUES (3, 'c', 35)").unwrap()).unwrap();
+
+        // SUM(age) WHERE age >= 30 → 30 + 35 = 65
+        let results = executor.execute(parse_sql("SELECT SUM(age) FROM t WHERE age >= 30").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "65", "SUM(age) WHERE age >= 30 应为 65");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_aggregate_empty_table() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, score INTEGER)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("SELECT SUM(score) FROM t").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "0", "空表 SUM 应为 0");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== OFFSET 分页测试 =====
+
+    #[test]
+    fn test_offset_basic() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        for i in 1..=5 {
+            let sql = format!("INSERT INTO t (id, name) VALUES ({}, 'item{}')", i, i);
+            executor.execute(parse_sql(&sql).unwrap()).unwrap();
+        }
+
+        // OFFSET 2 → 跳过前2行，返回3行
+        let results = executor.execute(parse_sql("SELECT id, name FROM t ORDER BY id ASC OFFSET 2").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "OFFSET 2 应返回3行");
+                assert_eq!(rows[0][0], "3", "第一行应为 id=3");
+                assert_eq!(rows[2][0], "5", "最后一行应为 id=5");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_limit_with_offset() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        for i in 1..=10 {
+            let sql = format!("INSERT INTO t (id, name) VALUES ({}, 'item{}')", i, i);
+            executor.execute(parse_sql(&sql).unwrap()).unwrap();
+        }
+
+        // LIMIT 3 OFFSET 5 → 第6-8行
+        let results = executor.execute(parse_sql("SELECT id, name FROM t ORDER BY id ASC LIMIT 3 OFFSET 5").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "LIMIT 3 OFFSET 5 应返回3行");
+                assert_eq!(rows[0][0], "6", "第一行应为 id=6");
+                assert_eq!(rows[2][0], "8", "最后一行应为 id=8");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_offset_exceeds_count() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id) VALUES (1)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id) VALUES (2)").unwrap()).unwrap();
+
+        // OFFSET 10 > 行数 → 空结果
+        let results = executor.execute(parse_sql("SELECT id FROM t OFFSET 10").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0, "OFFSET 超过行数应返回空");
             }
             _ => panic!("Expected SelectResult"),
         }

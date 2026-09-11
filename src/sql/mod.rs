@@ -21,6 +21,7 @@ pub enum SQLStatement {
         where_clause: Option<String>,
         order_by: Option<String>,
         limit: Option<u64>,
+        offset: Option<u64>,
         distinct: bool,
     },
     Delete {
@@ -270,6 +271,7 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let mut where_clause = None;
     let mut order_by = None;
     let mut limit = None;
+    let mut offset = None;
 
     let mut remaining = rest_after_table.trim().to_string();
     let upper = remaining.to_uppercase();
@@ -300,21 +302,28 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let upper2 = remaining.to_uppercase();
     if upper2.starts_with("ORDER BY ") {
         let order_rest = remaining[9..].trim().to_string();
-        let end = order_rest.to_uppercase().find(" LIMIT").unwrap_or(order_rest.len());
+        let end = order_rest.to_uppercase().find(" LIMIT")
+            .or_else(|| order_rest.to_uppercase().find(" OFFSET"))
+            .unwrap_or(order_rest.len());
         order_by = Some(order_rest[..end].trim().to_string());
-        // 更新remaining用于后续LIMIT解析
         if end < order_rest.len() {
             remaining = order_rest[end..].to_string();
         }
     } else if let Some(pos) = upper2.find(" ORDER BY ") {
         let order_rest = remaining[pos + 10..].trim().to_string();
-        let end = order_rest.to_uppercase().find(" LIMIT").unwrap_or(order_rest.len());
+        let end = order_rest.to_uppercase().find(" LIMIT")
+            .or_else(|| order_rest.to_uppercase().find(" OFFSET"))
+            .unwrap_or(order_rest.len());
         order_by = Some(order_rest[..end].trim().to_string());
+        remaining = order_rest[end..].to_string();
     } else if let Some(pos) = upper2.find(" ORDER") {
         if remaining[pos..].to_uppercase().starts_with(" ORDER BY ") {
             let order_rest = remaining[pos + 9..].trim().to_string();
-            let end = order_rest.to_uppercase().find(" LIMIT").unwrap_or(order_rest.len());
+            let end = order_rest.to_uppercase().find(" LIMIT")
+                .or_else(|| order_rest.to_uppercase().find(" OFFSET"))
+                .unwrap_or(order_rest.len());
             order_by = Some(order_rest[..end].trim().to_string());
+            remaining = order_rest[end..].to_string();
         }
     }
 
@@ -325,10 +334,48 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         if let Ok(n) = limit_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
             limit = Some(n);
         }
+        // LIMIT 后面可能跟 OFFSET
+        let after_limit = remaining[6..].trim();
+        if let Some(offset_pos) = after_limit.to_uppercase().find(" OFFSET ") {
+            let offset_str = after_limit[offset_pos + 8..].trim();
+            if let Ok(n) = offset_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                offset = Some(n);
+            }
+        } else if let Some(offset_pos) = after_limit.to_uppercase().find(" OFFSET") {
+            // LIMIT 10 OFFSET 5 — OFFSET 在数字之后
+            let offset_str = after_limit[offset_pos + 7..].trim();
+            if let Ok(n) = offset_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                offset = Some(n);
+            }
+        }
     } else if let Some(pos) = remaining_upper.find(" LIMIT ") {
         let limit_str = remaining[pos + 7..].trim();
         if let Ok(n) = limit_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
             limit = Some(n);
+        }
+        let after_limit = remaining[pos + 7..].trim();
+        if let Some(offset_pos) = after_limit.to_uppercase().find(" OFFSET ") {
+            let offset_str = after_limit[offset_pos + 8..].trim();
+            if let Ok(n) = offset_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                offset = Some(n);
+            }
+        }
+    }
+
+    // OFFSET 单独出现（无 LIMIT）：SELECT * FROM t OFFSET 5
+    if offset.is_none() {
+        let ru = remaining.to_uppercase();
+        // OFFSET 可能在开头（如 "OFFSET 5"）或中间（如 " OFFSET 5"）
+        if ru.starts_with("OFFSET ") {
+            let offset_str = remaining[7..].trim();
+            if let Ok(n) = offset_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                offset = Some(n);
+            }
+        } else if let Some(pos) = ru.find(" OFFSET ") {
+            let offset_str = remaining[pos + 8..].trim();
+            if let Ok(n) = offset_str.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                offset = Some(n);
+            }
         }
     }
 
@@ -338,6 +385,7 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         where_clause,
         order_by,
         limit,
+        offset,
         distinct,
     })
 }
