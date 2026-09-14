@@ -167,7 +167,7 @@ impl Executor {
                 })
             }
 
-            SQLStatement::Select { table_name, columns, where_clause, order_by, limit, offset, distinct } => {
+            SQLStatement::Select { table_name, columns, where_clause, order_by, group_by, limit, offset, distinct } => {
                 let schema = self.engine.get_schema(&table_name)?;
                 let all_col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -194,6 +194,11 @@ impl Executor {
 
                 // 提取原始行（过滤后的）
                 let matched: Vec<Row> = scored_rows.iter().map(|(r, _)| r.clone()).collect();
+
+                // ===== GROUP BY 分组聚合 =====
+                if let Some(ref gb_str) = group_by {
+                    return execute_group_by(&matched, &columns, gb_str, &schema);
+                }
 
                 // ===== 列投影解析 =====
                 // SELECT *          → 所有列
@@ -360,7 +365,7 @@ impl Executor {
 // ===== 聚合函数支持 =====
 
 /// 聚合函数类型
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 enum AggFunc {
     Sum,
     Avg,
@@ -395,6 +400,224 @@ fn extract_agg_column(s: &str) -> &str {
         }
     }
     s
+}
+
+/// GROUP BY 分组聚合执行
+/// 支持语法: SELECT dept, COUNT(*), SUM(salary) FROM employees GROUP BY dept
+/// SELECT 子句中的普通列 = 分组键，聚合函数 = 对组内数据聚合
+fn execute_group_by(
+    rows: &[Row],
+    columns: &[String],
+    group_by_str: &str,
+    schema: &TableSchema,
+) -> Result<ExecuteResult, String> {
+    // 解析 GROUP BY 列名（支持多列 GROUP BY a, b）
+    let gb_cols: Vec<String> = group_by_str
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .collect();
+
+    // 验证 GROUP BY 列存在，获取索引
+    let mut gb_indices: Vec<usize> = Vec::new();
+    for gb_col in &gb_cols {
+        let ci = schema
+            .columns
+            .iter()
+            .find(|c| c.name == *gb_col)
+            .ok_or_else(|| format!("GROUP BY 列 '{}' 不存在", gb_col))?;
+        gb_indices.push(ci.index);
+    }
+
+    // 解析 SELECT 子句：区分分组键列和聚合函数
+    // 例如 SELECT dept, COUNT(*), SUM(salary) → [(dept, idx, is_agg), ...]
+    #[derive(Clone)]
+    struct SelectItem {
+        label: String,     // 输出列名
+        is_agg: bool,      // 是否是聚合函数
+        agg_fn: Option<AggFunc>,
+        col_name: String,  // 聚合函数内的列名（或分组键列名）
+        col_index: usize,  // 列索引
+        is_count_star: bool,
+        data_type: DataType,
+    }
+
+    let mut select_items: Vec<SelectItem> = Vec::new();
+    for col in columns {
+        let col_trimmed = col.trim();
+        let upper = col_trimmed.to_uppercase();
+
+        // COUNT(*)
+        if upper == "COUNT(*)" || upper == "COUNT (*)" {
+            select_items.push(SelectItem {
+                label: "count".to_string(),
+                is_agg: true,
+                agg_fn: None,
+                col_name: String::new(),
+                col_index: 0,
+                is_count_star: true,
+                data_type: DataType::Integer,
+            });
+            continue;
+        }
+
+        // SUM/AVG/MIN/MAX
+        if let Some(agg_fn) = parse_aggregate(&upper) {
+            let inner_col = extract_agg_column(&upper);
+            let col_name = inner_col.trim().to_lowercase();
+            let ci = schema
+                .columns
+                .iter()
+                .find(|c| c.name == col_name)
+                .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+            let agg_name = match agg_fn {
+                AggFunc::Sum => "sum",
+                AggFunc::Avg => "avg",
+                AggFunc::Min => "min",
+                AggFunc::Max => "max",
+            };
+            select_items.push(SelectItem {
+                label: agg_name.to_string(),
+                is_agg: true,
+                agg_fn: Some(agg_fn),
+                col_name,
+                col_index: ci.index,
+                is_count_star: false,
+                data_type: ci.data_type.clone(),
+            });
+            continue;
+        }
+
+        // 普通列 — 必须是 GROUP BY 的分组键
+        let col_name = col_trimmed.to_lowercase();
+        let ci = schema
+            .columns
+            .iter()
+            .find(|c| c.name == col_name)
+            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+
+        // 检查是否是 GROUP BY 的列之一
+        if !gb_cols.contains(&col_name) {
+            return Err(format!(
+                "列 '{}' 不在 GROUP BY 中（非聚合列必须出现在 GROUP BY 子句中）",
+                col_name
+            ));
+        }
+
+        select_items.push(SelectItem {
+            label: col_name.clone(),
+            is_agg: false,
+            agg_fn: None,
+            col_name,
+            col_index: ci.index,
+            is_count_star: false,
+            data_type: ci.data_type.clone(),
+        });
+    }
+
+    // 分组：用行内分组键的字符串表示作为 HashMap 的 key，保持首次出现顺序
+    use std::collections::HashMap;
+    let mut group_order: Vec<String> = Vec::new(); // 保持分组出现顺序
+    let mut groups: HashMap<String, Vec<&Row>> = HashMap::new();
+
+    for row in rows {
+        let key: String = gb_indices
+            .iter()
+            .map(|&idx| {
+                row.values
+                    .get(idx)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("\x1f"); // 用分隔符连接，避免值碰撞
+
+        if !groups.contains_key(&key) {
+            group_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(row);
+    }
+
+    // 输出列名
+    let result_columns: Vec<String> = select_items.iter().map(|si| si.label.clone()).collect();
+
+    // 对每个分组计算输出行
+    let mut result_rows: Vec<Vec<String>> = Vec::new();
+
+    for key in &group_order {
+        let group_rows = groups.get(key).unwrap();
+        let mut output_row: Vec<String> = Vec::new();
+
+        for si in &select_items {
+            if !si.is_agg {
+                // 普通列：取第一行的值（同一组内值相同）
+                let val = group_rows
+                    .first()
+                    .and_then(|r| r.values.get(si.col_index))
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                output_row.push(val);
+            } else if si.is_count_star {
+                // COUNT(*) = 组内行数
+                output_row.push(group_rows.len().to_string());
+            } else {
+                // SUM/AVG/MIN/MAX
+                let agg_fn = si.agg_fn.clone().unwrap();
+                let mut nums: Vec<f64> = Vec::new();
+                for row in group_rows {
+                    if let Some(v) = row.values.get(si.col_index) {
+                        match v {
+                            Value::Integer(n) => nums.push(*n as f64),
+                            Value::Float(f) => nums.push(*f),
+                            _ => {}
+                        }
+                    }
+                }
+
+                let agg_value = match agg_fn {
+                    AggFunc::Sum => nums.iter().sum::<f64>(),
+                    AggFunc::Avg => {
+                        if nums.is_empty() {
+                            0.0
+                        } else {
+                            nums.iter().sum::<f64>() / nums.len() as f64
+                        }
+                    }
+                    AggFunc::Min => {
+                        if nums.is_empty() {
+                            0.0
+                        } else {
+                            nums.iter().cloned().fold(f64::INFINITY, f64::min)
+                        }
+                    }
+                    AggFunc::Max => {
+                        if nums.is_empty() {
+                            0.0
+                        } else {
+                            nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                        }
+                    }
+                };
+
+                // 格式化：整数列+非AVG→整数格式，否则浮点
+                let value_str = if agg_value == agg_value.trunc()
+                    && si.data_type == DataType::Integer
+                    && agg_fn != AggFunc::Avg
+                {
+                    format!("{}", agg_value as i64)
+                } else {
+                    format!("{}", agg_value)
+                };
+                output_row.push(value_str);
+            }
+        }
+
+        result_rows.push(output_row);
+    }
+
+    Ok(ExecuteResult::SelectResult {
+        columns: result_columns,
+        rows: result_rows,
+    })
 }
 
 // ===== 向量相似度原生函数支持 =====
@@ -1778,6 +2001,179 @@ mod tests {
         match &results[0] {
             ExecuteResult::SelectResult { rows, .. } => {
                 assert_eq!(rows.len(), 0, "OFFSET 超过行数应返回空");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== GROUP BY 分组聚合测试 =====
+
+    #[test]
+    fn test_group_by_count_star() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE emp (id INTEGER, dept TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (1, 'eng', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (2, 'eng', 120)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (3, 'sales', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (4, 'sales', 110)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (5, 'eng', 130)").unwrap()).unwrap();
+
+        // SELECT dept, COUNT(*) FROM emp GROUP BY dept
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*) FROM emp GROUP BY dept").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["dept".to_string(), "count".to_string()]);
+                assert_eq!(rows.len(), 2, "应分2组: eng, sales");
+                // eng 组有3人，sales 组有2人
+                let eng_row = rows.iter().find(|r| r[0] == "eng").unwrap();
+                assert_eq!(eng_row[1], "3", "eng 组应有3人");
+                let sales_row = rows.iter().find(|r| r[0] == "sales").unwrap();
+                assert_eq!(sales_row[1], "2", "sales 组应有2人");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_sum_avg() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE emp (id INTEGER, dept TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (1, 'eng', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (2, 'eng', 120)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (3, 'sales', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (4, 'sales', 110)").unwrap()).unwrap();
+
+        // SELECT dept, SUM(salary), AVG(salary) FROM emp GROUP BY dept
+        let results = executor.execute(parse_sql("SELECT dept, SUM(salary), AVG(salary) FROM emp GROUP BY dept").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["dept".to_string(), "sum".to_string(), "avg".to_string()]);
+                assert_eq!(rows.len(), 2);
+
+                let eng_row = rows.iter().find(|r| r[0] == "eng").unwrap();
+                assert_eq!(eng_row[1], "220", "eng SUM(salary) 应为 220");
+                let avg: f64 = eng_row[2].parse().unwrap();
+                assert!((avg - 110.0).abs() < 0.01, "eng AVG(salary) 应为 110, 得到 {}", avg);
+
+                let sales_row = rows.iter().find(|r| r[0] == "sales").unwrap();
+                assert_eq!(sales_row[1], "200", "sales SUM(salary) 应为 200");
+                let avg: f64 = sales_row[2].parse().unwrap();
+                assert!((avg - 100.0).abs() < 0.01, "sales AVG(salary) 应为 100, 得到 {}", avg);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_min_max() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, cat TEXT, val INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, val) VALUES (1, 'a', 10)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, val) VALUES (2, 'a', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, val) VALUES (3, 'b', 20)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, val) VALUES (4, 'b', 50)").unwrap()).unwrap();
+
+        let results = executor.execute(parse_sql("SELECT cat, MIN(val), MAX(val) FROM t GROUP BY cat").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["cat".to_string(), "min".to_string(), "max".to_string()]);
+                assert_eq!(rows.len(), 2);
+
+                let a_row = rows.iter().find(|r| r[0] == "a").unwrap();
+                assert_eq!(a_row[1], "10", "a MIN 应为 10");
+                assert_eq!(a_row[2], "30", "a MAX 应为 30");
+
+                let b_row = rows.iter().find(|r| r[0] == "b").unwrap();
+                assert_eq!(b_row[1], "20", "b MIN 应为 20");
+                assert_eq!(b_row[2], "50", "b MAX 应为 50");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_with_where() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (1, 'eng', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (2, 'eng', 120)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (3, 'eng', 80)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (4, 'sales', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (5, 'sales', 110)").unwrap()).unwrap();
+
+        // WHERE salary >= 90 → 过滤后: eng(100,120), sales(90,110)
+        // GROUP BY dept → eng: 2人 sum=220, sales: 2人 sum=200
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*), SUM(salary) FROM t WHERE salary >= 90 GROUP BY dept").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "WHERE 后应分2组");
+
+                let eng_row = rows.iter().find(|r| r[0] == "eng").unwrap();
+                assert_eq!(eng_row[1], "2", "eng 过滤后应有2人");
+                assert_eq!(eng_row[2], "220", "eng SUM 应为 220");
+
+                let sales_row = rows.iter().find(|r| r[0] == "sales").unwrap();
+                assert_eq!(sales_row[1], "2", "sales 过滤后应有2人");
+                assert_eq!(sales_row[2], "200", "sales SUM 应为 200");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_empty_table() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, val INTEGER)").unwrap()).unwrap();
+
+        // 空表 GROUP BY → 返回空结果（无分组）
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*) FROM t GROUP BY dept").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0, "空表 GROUP BY 应返回0行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_single_group() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, val INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (1, 'x', 10)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (2, 'x', 20)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (3, 'x', 30)").unwrap()).unwrap();
+
+        // 所有行同一分组
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*), SUM(val) FROM t GROUP BY dept").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 1, "同一分组应返回1行");
+                assert_eq!(rows[0][0], "x");
+                assert_eq!(rows[0][1], "3");
+                assert_eq!(rows[0][2], "60");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_group_by_multi_column() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, level TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, level, salary) VALUES (1, 'eng', 'junior', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, level, salary) VALUES (2, 'eng', 'senior', 200)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, level, salary) VALUES (3, 'eng', 'junior', 110)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, level, salary) VALUES (4, 'sales', 'junior', 90)").unwrap()).unwrap();
+
+        // GROUP BY dept, level → 3组: (eng,junior), (eng,senior), (sales,junior)
+        let results = executor.execute(parse_sql("SELECT dept, level, COUNT(*) FROM t GROUP BY dept, level").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["dept".to_string(), "level".to_string(), "count".to_string()]);
+                assert_eq!(rows.len(), 3, "多列 GROUP BY 应分3组");
+
+                let eng_junior = rows.iter().find(|r| r[0] == "eng" && r[1] == "junior").unwrap();
+                assert_eq!(eng_junior[2], "2", "eng/junior 应有2人");
             }
             _ => panic!("Expected SelectResult"),
         }
