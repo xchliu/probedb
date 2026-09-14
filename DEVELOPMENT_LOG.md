@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-09-14
+
+### 完成
+- **GROUP BY 分组聚合**
+  - SQL 解析器：新增 GROUP BY 子句解析，WHERE→GROUP BY→ORDER BY→LIMIT 完整子句链路
+  - 执行器新增 `execute_group_by()` 分组聚合引擎
+  - 支持单列/多列 GROUP BY（`GROUP BY dept` / `GROUP BY dept, level`）
+  - SELECT 子句支持分组键列 + 聚合函数组合（`SELECT dept, COUNT(*), SUM(salary) FROM emp GROUP BY dept`）
+  - 非聚合列必须出现在 GROUP BY 中（SQL 标准校验，不满足则报错）
+  - 分组保持首次出现顺序（HashMap + order vector，结果确定性）
+  - 与 WHERE 联动（先 WHERE 过滤，再分组聚合）
+  - 空表 GROUP BY 返回 0 行（无分组）
+  - 整数列 SUM/MIN/MAX 返回整数格式，AVG 返回浮点
+
+### 测试
+- 117 passed, 0 failed（110→117，新增 7 个）
+- test_group_by_count_star: COUNT(*) 分组
+- test_group_by_sum_avg: SUM+AVG 组合聚合
+- test_group_by_min_max: MIN+MAX 组合聚合
+- test_group_by_with_where: WHERE + GROUP BY 联动
+- test_group_by_empty_table: 空表返回0行
+- test_group_by_single_group: 全表同一组返回1行
+- test_group_by_multi_column: 多列 GROUP BY
+
+### 决策
+- GROUP BY 是聚合函数的自然延伸：上周完成 SUM/AVG/MIN/MAX（全表聚合），本周实现分组聚合
+- 本周无新周计划，按规则继续推进——GROUP BY 不依赖 Hermes 接入决策
+- 非聚合列必须在 GROUP BY 中：SQL 标准语义，避免歧义（SQLite 允许非分组列返回任意行值，ProbeDB 选择更严格）
+- 分组顺序保持首次出现：结果确定性，避免 HashMap 迭代顺序不一致
+- 多列分组键用 `\x1f`（Unit Separator）连接避免值碰撞
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-09-11
 
 ### 完成
