@@ -21,6 +21,7 @@ pub enum SQLStatement {
         where_clause: Option<String>,
         order_by: Option<String>,
         group_by: Option<String>,
+        having: Option<String>,
         limit: Option<u64>,
         offset: Option<u64>,
         distinct: bool,
@@ -272,6 +273,7 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let mut where_clause = None;
     let mut order_by = None;
     let mut group_by = None;
+    let mut having = None;
     let mut limit = None;
     let mut offset = None;
 
@@ -281,10 +283,11 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     // WHERE — 处理"WHERE age > 30"开头的情况
     if upper.starts_with("WHERE ") || upper.starts_with("WHERE\n") {
         // remaining 现在是 "WHERE age > 30 ..."
-        // 提取条件到 GROUP BY / ORDER BY / LIMIT
+        // 提取条件到 GROUP BY / HAVING / ORDER BY / LIMIT
         let rest = remaining[6..].trim().to_string(); // 去掉 "WHERE "
         let rest_upper = rest.to_uppercase();
         let where_end = rest_upper.find(" GROUP BY ")
+            .or_else(|| rest_upper.find(" HAVING "))
             .or_else(|| rest_upper.find(" ORDER BY "))
             .or_else(|| rest_upper.find(" LIMIT "))
             .unwrap_or(rest.len());
@@ -297,10 +300,11 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         }
     } else if let Some(pos) = upper.find(" WHERE ") {
         let cond_start = pos + 7;
-        // WHERE 条件到 GROUP BY / ORDER BY / LIMIT
+        // WHERE 条件到 GROUP BY / HAVING / ORDER BY / LIMIT
         let after_where = &remaining[cond_start..];
         let after_upper = after_where.to_uppercase();
         let where_end = after_upper.find(" GROUP BY ")
+            .or_else(|| after_upper.find(" HAVING "))
             .or_else(|| after_upper.find(" ORDER BY "))
             .or_else(|| after_upper.find(" LIMIT "))
             .unwrap_or(after_where.len());
@@ -312,9 +316,11 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let upper_gb = remaining.to_uppercase();
     if upper_gb.starts_with("GROUP BY ") {
         let gb_rest = remaining[9..].trim().to_string();
-        let end = gb_rest.to_uppercase().find(" ORDER BY ")
-            .or_else(|| gb_rest.to_uppercase().find(" LIMIT "))
-            .or_else(|| gb_rest.to_uppercase().find(" OFFSET"))
+        let gb_upper = gb_rest.to_uppercase();
+        let end = gb_upper.find(" HAVING ")
+            .or_else(|| gb_upper.find(" ORDER BY "))
+            .or_else(|| gb_upper.find(" LIMIT "))
+            .or_else(|| gb_upper.find(" OFFSET"))
             .unwrap_or(gb_rest.len());
         group_by = Some(gb_rest[..end].trim().to_string());
         if end < gb_rest.len() {
@@ -324,12 +330,40 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         }
     } else if let Some(pos) = upper_gb.find(" GROUP BY ") {
         let gb_rest = remaining[pos + 10..].trim().to_string();
-        let end = gb_rest.to_uppercase().find(" ORDER BY ")
-            .or_else(|| gb_rest.to_uppercase().find(" LIMIT "))
-            .or_else(|| gb_rest.to_uppercase().find(" OFFSET"))
+        let gb_upper = gb_rest.to_uppercase();
+        let end = gb_upper.find(" HAVING ")
+            .or_else(|| gb_upper.find(" ORDER BY "))
+            .or_else(|| gb_upper.find(" LIMIT "))
+            .or_else(|| gb_upper.find(" OFFSET"))
             .unwrap_or(gb_rest.len());
         group_by = Some(gb_rest[..end].trim().to_string());
         remaining = gb_rest[end..].to_string();
+    }
+
+    // HAVING — 检查是否以 HAVING 开头（GROUP BY 之后、ORDER BY 之前）
+    let upper_hv = remaining.to_uppercase();
+    if upper_hv.starts_with("HAVING ") {
+        let hv_rest = remaining[7..].trim().to_string();
+        let hv_upper = hv_rest.to_uppercase();
+        let end = hv_upper.find(" ORDER BY ")
+            .or_else(|| hv_upper.find(" LIMIT "))
+            .or_else(|| hv_upper.find(" OFFSET"))
+            .unwrap_or(hv_rest.len());
+        having = Some(hv_rest[..end].trim().to_string());
+        if end < hv_rest.len() {
+            remaining = hv_rest[end..].to_string();
+        } else {
+            remaining = String::new();
+        }
+    } else if let Some(pos) = upper_hv.find(" HAVING ") {
+        let hv_rest = remaining[pos + 8..].trim().to_string();
+        let hv_upper = hv_rest.to_uppercase();
+        let end = hv_upper.find(" ORDER BY ")
+            .or_else(|| hv_upper.find(" LIMIT "))
+            .or_else(|| hv_upper.find(" OFFSET"))
+            .unwrap_or(hv_rest.len());
+        having = Some(hv_rest[..end].trim().to_string());
+        remaining = hv_rest[end..].to_string();
     }
 
     // ORDER BY — 先检查是否以 ORDER BY 开头
@@ -419,6 +453,7 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         where_clause,
         order_by,
         group_by,
+        having,
         limit,
         offset,
         distinct,

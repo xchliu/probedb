@@ -167,7 +167,7 @@ impl Executor {
                 })
             }
 
-            SQLStatement::Select { table_name, columns, where_clause, order_by, group_by, limit, offset, distinct } => {
+            SQLStatement::Select { table_name, columns, where_clause, order_by, group_by, having, limit, offset, distinct } => {
                 let schema = self.engine.get_schema(&table_name)?;
                 let all_col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -197,7 +197,7 @@ impl Executor {
 
                 // ===== GROUP BY 分组聚合 =====
                 if let Some(ref gb_str) = group_by {
-                    return execute_group_by(&matched, &columns, gb_str, &schema);
+                    return execute_group_by(&matched, &columns, gb_str, having.as_deref(), &schema);
                 }
 
                 // ===== 列投影解析 =====
@@ -405,10 +405,12 @@ fn extract_agg_column(s: &str) -> &str {
 /// GROUP BY 分组聚合执行
 /// 支持语法: SELECT dept, COUNT(*), SUM(salary) FROM employees GROUP BY dept
 /// SELECT 子句中的普通列 = 分组键，聚合函数 = 对组内数据聚合
+/// HAVING 子句过滤分组后的聚合结果（如 HAVING COUNT(*) > 2）
 fn execute_group_by(
     rows: &[Row],
     columns: &[String],
     group_by_str: &str,
+    having: Option<&str>,
     schema: &TableSchema,
 ) -> Result<ExecuteResult, String> {
     // 解析 GROUP BY 列名（支持多列 GROUP BY a, b）
@@ -614,9 +616,162 @@ fn execute_group_by(
         result_rows.push(output_row);
     }
 
+    // ===== HAVING 过滤 =====
+    if let Some(having_str) = having {
+        result_rows = filter_having_rows(
+            result_rows,
+            &result_columns,
+            having_str,
+        )?;
+    }
+
     Ok(ExecuteResult::SelectResult {
         columns: result_columns,
         rows: result_rows,
+    })
+}
+
+/// 求值 HAVING 条件
+/// HAVING 可以引用聚合函数（COUNT(*)/SUM(col)/AVG(col)/MIN(col)/MAX(col)）和分组键列
+/// 条件格式：聚合函数或列名 + 比较运算符 + 字面量，支持 AND/OR
+fn filter_having_rows(
+    rows: Vec<Vec<String>>,
+    columns: &[String],
+    having: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    // 按 OR 分割
+    let or_parts: Vec<&str> = split_top_level(having, " OR ");
+    let mut kept_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for row_idx in 0..rows.len() {
+        let row = &rows[row_idx];
+        let or_pass = or_parts.iter().any(|or_part| {
+            let and_parts: Vec<&str> = split_top_level(or_part, " AND ");
+            and_parts.iter().all(|cond| {
+                eval_having_condition(cond, row, columns)
+                    .unwrap_or(false)
+            })
+        });
+        if or_pass {
+            kept_indices.insert(row_idx);
+        }
+    }
+
+    Ok(rows
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| kept_indices.contains(i))
+        .map(|(_, r)| r)
+        .collect())
+}
+
+/// 求值单个 HAVING 条件
+/// 条件左侧可以是：聚合函数（COUNT(*)/SUM(col)/...）或分组键列名
+/// 条件右侧是字面量
+fn eval_having_condition(
+    cond: &str,
+    row: &[String],
+    columns: &[String],
+) -> Result<bool, String> {
+    let c = cond.trim();
+
+    // 找到操作符位置（跳过聚合函数内的括号）
+    let ops = [">=", "<=", "!=", "=", ">", "<"];
+    let mut op_pos = None;
+    let mut found_op = "";
+    let mut paren_depth = 0;
+
+    let chars: Vec<(usize, char)> = c.char_indices().collect();
+    for &(i, ch) in &chars {
+        if ch == '(' { paren_depth += 1; }
+        else if ch == ')' && paren_depth > 0 { paren_depth -= 1; }
+        else if paren_depth == 0 {
+            for op in &ops {
+                if c[i..].starts_with(op) {
+                    // 确保前面不是字母/数字/下划线（避免匹配列名中的等号）
+                    if i > 0 {
+                        let before = chars[i - 1].1;
+                        if before.is_alphanumeric() || before == '_' {
+                            continue;
+                        }
+                    }
+                    op_pos = Some(i);
+                    found_op = op;
+                    break;
+                }
+            }
+            if op_pos.is_some() { break; }
+        }
+    }
+
+    let pos = op_pos.ok_or_else(|| format!("HAVING 条件缺少比较操作符: {}", c))?;
+    let left = c[..pos].trim();
+    let right_str = c[pos + found_op.len()..].trim();
+
+    // 解析左侧值
+    let left_upper = left.to_uppercase();
+    let left_val: f64;
+
+    // COUNT(*) 聚合
+    if left_upper == "COUNT(*)" || left_upper == "COUNT (*)" {
+        // COUNT(*) 的值就是输出行中 "count" 列的值
+        if let Some(col_idx) = columns.iter().position(|c| *c == "count") {
+            left_val = row[col_idx].parse::<f64>().unwrap_or(0.0);
+        } else {
+            return Err("HAVING 引用 COUNT(*) 但 SELECT 中没有 COUNT(*)".to_string());
+        }
+    }
+    // SUM/AVG/MIN/MAX 聚合
+    else if let Some(agg_fn) = parse_aggregate(&left_upper) {
+        let agg_name = match agg_fn {
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        };
+        // 从输出列中找到对应的聚合值
+        if let Some(col_idx) = columns.iter().position(|c| *c == agg_name) {
+            left_val = row[col_idx].parse::<f64>().unwrap_or(0.0);
+        } else {
+            return Err(format!("HAVING 引用 {} 但 SELECT 中没有该聚合", agg_name));
+        }
+    }
+    // 分组键列名
+    else {
+        let col_name = left.to_lowercase();
+        // 从输出列中找到分组键值
+        if let Some(col_idx) = columns.iter().position(|c| *c == col_name) {
+            // 尝试数值比较，否则字符串比较
+            let left_str = &row[col_idx];
+            let right_parsed = parse_literal(right_str);
+            let left_parsed = parse_literal(left_str);
+            let cmp = compare_values(&left_parsed, &right_parsed);
+            return Ok(match found_op {
+                ">"  => cmp == std::cmp::Ordering::Greater,
+                ">=" => cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal,
+                "<"  => cmp == std::cmp::Ordering::Less,
+                "<=" => cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal,
+                "="  => cmp == std::cmp::Ordering::Equal,
+                "!=" => cmp != std::cmp::Ordering::Equal,
+                _ => false,
+            });
+        }
+        return Err(format!("HAVING 引用了未知列或聚合: {}", left));
+    }
+
+    // 解析右侧值（字面量 → f64）
+    let right_val: f64 = right_str
+        .parse::<f64>()
+        .map_err(|_| format!("HAVING 条件右侧不是数值: {}", right_str))?;
+
+    Ok(match found_op {
+        ">"  => left_val > right_val,
+        ">=" => left_val >= right_val,
+        "<"  => left_val < right_val,
+        "<=" => left_val <= right_val,
+        "="  => (left_val - right_val).abs() < 1e-10,
+        "!=" => (left_val - right_val).abs() >= 1e-10,
+        _ => false,
     })
 }
 
@@ -2174,6 +2329,156 @@ mod tests {
 
                 let eng_junior = rows.iter().find(|r| r[0] == "eng" && r[1] == "junior").unwrap();
                 assert_eq!(eng_junior[2], "2", "eng/junior 应有2人");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== HAVING 过滤测试 =====
+
+    #[test]
+    fn test_having_count_star() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE emp (id INTEGER, dept TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (1, 'eng', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (2, 'eng', 120)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (3, 'eng', 130)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (4, 'sales', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, salary) VALUES (5, 'sales', 110)").unwrap()).unwrap();
+
+        // HAVING COUNT(*) > 2 → 只有 eng 有3人，sales 有2人被过滤
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 2").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 1, "HAVING COUNT(*) > 2 应只保留1组");
+                assert_eq!(rows[0][0], "eng", "保留的组是 eng");
+                assert_eq!(rows[0][1], "3", "eng 有3人");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_sum() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, val INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (1, 'a', 10)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (2, 'a', 20)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (3, 'b', 5)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (4, 'b', 5)").unwrap()).unwrap();
+
+        // HAVING SUM(val) > 20 → a: sum=30 保留, b: sum=10 过滤
+        let results = executor.execute(parse_sql("SELECT dept, SUM(val) FROM t GROUP BY dept HAVING SUM(val) > 20").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 1, "HAVING SUM(val) > 20 应只保留1组");
+                assert_eq!(rows[0][0], "a", "保留的组是 a");
+                assert_eq!(rows[0][1], "30", "a SUM = 30");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_with_where() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (1, 'eng', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (2, 'eng', 120)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (3, 'eng', 80)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (4, 'sales', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (5, 'sales', 110)").unwrap()).unwrap();
+
+        // WHERE salary >= 90 → eng(100,120)=2人 sum=220, sales(90,110)=2人 sum=200
+        // HAVING COUNT(*) >= 2 → 两组都保留（各2人）
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*), SUM(salary) FROM t WHERE salary >= 90 GROUP BY dept HAVING COUNT(*) >= 2").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "两组都应有2人");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_all_filtered() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, val INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (1, 'a', 10)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, val) VALUES (2, 'b', 20)").unwrap()).unwrap();
+
+        // HAVING SUM(val) > 100 → 无组满足，返回0行
+        let results = executor.execute(parse_sql("SELECT dept, SUM(val) FROM t GROUP BY dept HAVING SUM(val) > 100").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0, "HAVING 过滤掉所有组应返回0行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_avg() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, cat TEXT, score INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, score) VALUES (1, 'x', 80)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, score) VALUES (2, 'x', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, score) VALUES (3, 'y', 40)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, cat, score) VALUES (4, 'y', 60)").unwrap()).unwrap();
+
+        // HAVING AVG(score) > 50 → x: avg=85 保留, y: avg=50 过滤
+        let results = executor.execute(parse_sql("SELECT cat, AVG(score) FROM t GROUP BY cat HAVING AVG(score) > 50").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 1, "HAVING AVG(score) > 50 应只保留1组");
+                assert_eq!(rows[0][0], "x", "保留的组是 x");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_and_or() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, salary INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (1, 'eng', 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (2, 'eng', 120)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (3, 'sales', 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (4, 'sales', 110)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, dept, salary) VALUES (5, 'hr', 50)").unwrap()).unwrap();
+
+        // eng: count=2, sum=220; sales: count=2, sum=200; hr: count=1, sum=50
+        // HAVING COUNT(*) > 1 AND SUM(salary) > 200 → eng 保留 (2>1 AND 220>200)
+        // sales: 2>1 AND 200>200 → false
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*), SUM(salary) FROM t GROUP BY dept HAVING COUNT(*) > 1 AND SUM(salary) > 200").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 1, "AND 条件应只保留 eng");
+                assert_eq!(rows[0][0], "eng");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // HAVING COUNT(*) > 1 OR SUM(salary) > 100 → eng(2>1 T) + sales(2>1 T) + hr(1>1 F OR 50>100 F → F)
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*), SUM(salary) FROM t GROUP BY dept HAVING COUNT(*) > 1 OR SUM(salary) > 100").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "OR 条件应保留 eng + sales");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_empty_table() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, dept TEXT, val INTEGER)").unwrap()).unwrap();
+
+        // 空表 GROUP BY + HAVING → 0行
+        let results = executor.execute(parse_sql("SELECT dept, COUNT(*) FROM t GROUP BY dept HAVING COUNT(*) > 0").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0, "空表 HAVING 应返回0行");
             }
             _ => panic!("Expected SelectResult"),
         }
