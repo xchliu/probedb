@@ -4,6 +4,43 @@
 
 ---
 
+## 2026-09-15
+
+### 完成
+- **HAVING 子句（GROUP BY 后聚合过滤）**
+  - SQL 解析器：新增 HAVING 子句解析，完整子句链路 WHERE→GROUP BY→HAVING→ORDER BY→LIMIT→OFFSET
+  - 执行器新增 `filter_having_rows()` + `eval_having_condition()` 分组后过滤引擎
+  - HAVING 可引用聚合函数：`COUNT(*)`、`SUM(col)`、`AVG(col)`、`MIN(col)`、`MAX(col)`
+  - HAVING 可引用分组键列（字符串/数值比较）
+  - 支持 AND/OR 复合条件（复用 split_top_level 括号感知分割）
+  - 括号感知操作符检测：跳过聚合函数内的括号，避免误匹配函数参数中的 `>`/`<`
+  - 与 WHERE 联动（先 WHERE 过滤行→再 GROUP BY 分组→最后 HAVING 过滤组）
+  - 空表 GROUP BY + HAVING 返回 0 行
+
+### 测试
+- 124 passed, 0 failed（117→124，新增 7 个）
+- test_having_count_star: COUNT(*) > 2 过滤分组
+- test_having_sum: SUM(val) > 20 过滤分组
+- test_having_with_where: WHERE + GROUP BY + HAVING 联动
+- test_having_all_filtered: HAVING 过滤掉所有组返回 0 行
+- test_having_avg: AVG(score) > 50 过滤分组
+- test_having_and_or: AND/OR 复合条件
+- test_having_empty_table: 空表 HAVING 返回 0 行
+
+### 决策
+- HAVING 是 GROUP BY 的直接延伸：上周完成 GROUP BY 分组聚合，HAVING 过滤分组后结果是 SQL 标准配对子句
+- HAVING 求值策略：直接从已计算的输出行中查找聚合值（通过输出列名匹配），而非重新计算聚合——避免重复计算
+- 聚合函数匹配通过输出列名（"count"/"sum"/"avg"/"min"/"max"）：SELECT 中必须有对应聚合才能在 HAVING 中引用
+- 操作符检测括号感知：COUNT(*) 中的 `*` 不会被误解析，SUM(col) 中的列名不会被误分割
+- 不依赖 Hermes 接入决策，自主推进
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-09-14
 
 ### 完成
