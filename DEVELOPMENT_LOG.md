@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-09-16（晚间补记：INNER JOIN + 列名解析bug修复）
+
+### 完成
+- **INNER JOIN 基础实现**（周计划外的增量进展，由19:00 auto_commit脚本暴露的半成品触发修复）
+  - SQL 解析器：新增 `JoinClause` 结构体，解析 `INNER JOIN table ON left_col = right_col` / `JOIN ... ON ...`
+  - JOIN 在 WHERE 之前解析，remaining 正确传递后续子句
+  - 执行器：嵌套循环连接（MVP），合并 schema（右表列重命名为 `table.col` 避免冲突）
+  - 7 个 JOIN 测试：basic / where / order_by / no_match / limit / 列投影 / 无 INNER 关键字
+- **关键 bug 修复：列名解析优先级错误** ⚠️
+  - 根因：`get_column_value()` 和列投影的 `find()` 用 OR 条件组合多个匹配规则，
+    裸列名匹配（`c.name == bare`）抢在限定列名精确匹配（`c.name == col_name`）之前命中
+  - 后果：`JOIN` 后 `WHERE departments.name = 'Engineering'` 误命中左表 `users.name` 列，
+    返回 `alice`/`bob` 而非 `Engineering`/`Sales` → **静默错误结果**（数据库最高优先级缺陷）
+  - 修复：精确匹配优先（`find(c.name == col_name)`），`or_else` 回退到裸名模糊匹配
+  - 两处同步修复：`get_column_value()` + 列投影逻辑
+
+### 测试
+- 162 passed, 0 failed（155 → 162，+7 JOIN 测试全通过）
+- 修复的失败测试：`test_inner_join_with_where`, `test_inner_join_column_projection`
+
+### 决策
+- JOIN 合并 schema 采用 `table.col` 命名（带点），而非别名机制——MVP 阶段够用
+- 列名解析：精确匹配 > 裸名模糊匹配 > ends_with 模糊匹配，三级回退
+- 嵌套循环连接 O(M×N) 作为 MVP，后续可加 hash join 优化
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-09-16
 
 ### 完成
