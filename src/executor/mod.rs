@@ -168,24 +168,82 @@ impl Executor {
                 })
             }
 
-            SQLStatement::Select { table_name, columns, where_clause, order_by, group_by, having, limit, offset, distinct } => {
-                let schema = self.engine.get_schema(&table_name)?;
-                let all_col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            SQLStatement::Select { table_name, columns, where_clause, order_by, group_by, having, limit, offset, distinct, join } => {
+                let orig_schema = self.engine.get_schema(&table_name)?;
 
                 // 扫描全表
                 let rows = self.engine.scan_table(&table_name)?.clone();
+
+                // ===== JOIN 行合并 =====
+                // 将左表行与右表行按 ON 条件做等值连接（INNER JOIN）
+                let (joined_rows, joined_schema) = if let Some(ref jc) = join {
+                    let right_schema = self.engine.get_schema(&jc.table)?.clone();
+                    let right_rows = self.engine.scan_table(&jc.table)?.clone();
+
+                    // 解析连接列：left_col / right_col 可能是 "table.col" 或 "col" 形式
+                    let left_col_name = jc.left_col.rsplit('.').next().unwrap_or(&jc.left_col);
+                    let right_col_name = jc.right_col.rsplit('.').next().unwrap_or(&jc.right_col);
+
+                    let left_ci = orig_schema.columns.iter().find(|c| c.name == left_col_name)
+                        .ok_or_else(|| format!("JOIN 左表列 '{}' 不存在", left_col_name))?;
+                    let right_ci = right_schema.columns.iter().find(|c| c.name == right_col_name)
+                        .ok_or_else(|| format!("JOIN 右表列 '{}' 不存在", right_col_name))?;
+
+                    let left_idx = left_ci.index;
+                    let right_idx = right_ci.index;
+
+                    // 合并 schema：左表列 + 右表列（右表列重命名为 table.col 避免冲突）
+                    let mut merged_cols: Vec<ColumnInfo> = orig_schema.columns.clone();
+                    for rc in &right_schema.columns {
+                        merged_cols.push(ColumnInfo {
+                            name: format!("{}.{}", jc.table, rc.name),
+                            data_type: rc.data_type.clone(),
+                            index: merged_cols.len(),
+                        });
+                    }
+                    let merged_schema = TableSchema {
+                        name: format!("{}__join__{}", table_name, jc.table),
+                        columns: merged_cols,
+                    };
+
+                    // 嵌套循环连接（MVP 实现）
+                    let mut combined: Vec<Row> = Vec::new();
+                    let mut next_join_id = 1u64;
+                    for lr in &rows {
+                        let lval = lr.values.get(left_idx);
+                        for rr in &right_rows {
+                            let rval = rr.values.get(right_idx);
+                            if lval.is_some() && rval.is_some() && lval == rval {
+                                let mut merged_values = lr.values.clone();
+                                merged_values.extend(rr.values.clone());
+                                combined.push(Row {
+                                    id: next_join_id,
+                                    values: merged_values,
+                                });
+                                next_join_id += 1;
+                            }
+                        }
+                    }
+
+                    (combined, merged_schema)
+                } else {
+                    (rows.clone(), orig_schema.clone())
+                };
+
+                // 用 joined_schema 替代后续的 schema 引用
+                let schema = &joined_schema;
 
                 // 检查是否需要计算向量相似度（用于 ORDER BY）
                 let vector_sim_order = parse_order_by_vector_call(order_by.as_deref());
 
                 // 预先计算 vector_similarity 得分（如果 ORDER BY 需要）
                 let mut scored_rows: Vec<(Row, Option<f64>)> = if let Some(ref vs) = vector_sim_order {
-                    rows.into_iter().map(|row| {
-                        let score = compute_vector_similarity(&row, &vs.col_name, &vs.target, &schema);
+                    joined_rows.into_iter().map(|row| {
+                        let score = compute_vector_similarity(&row, &vs.col_name, &vs.target, schema);
                         (row, score)
                     }).collect()
                 } else {
-                    rows.into_iter().map(|r| (r, None)).collect()
+                    joined_rows.into_iter().map(|r| (r, None)).collect()
                 };
 
                 // WHERE 过滤（对带有 vector_similarity 调用的条件做原生求值）
@@ -275,7 +333,7 @@ impl Executor {
                 let proj_names: Vec<String>;
                 if columns.len() == 1 && columns[0] == "*" {
                     proj_indices = schema.columns.iter().map(|c| c.index).collect();
-                    proj_names = all_col_names.clone();
+                    proj_names = schema.columns.iter().map(|c| c.name.clone()).collect();
                 } else {
                     let mut idxs = Vec::new();
                     let mut names = Vec::new();
@@ -288,7 +346,10 @@ impl Executor {
                                 names.push(ci.name.clone());
                             }
                         } else {
-                            let ci = schema.columns.iter().find(|c| c.name == *col_name)
+                            // 支持限定列名 table.col 和裸列名 col
+                            let bare = col_name.rsplit('.').next().unwrap_or(col_name);
+                            let ci = schema.columns.iter()
+                                .find(|c| c.name == *col_name || c.name == *bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
                                 .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
                             idxs.push(ci.index);
                             names.push(ci.name.clone());
@@ -897,7 +958,10 @@ fn parse_order_by_str(order_by: &str) -> (String, bool) {
 // ===== WHERE 条件求值 =====
 
 fn get_column_value<'a>(row: &'a Row, col_name: &str, schema: &TableSchema) -> Result<&'a Value, String> {
-    let ci = schema.columns.iter().find(|c| c.name == col_name)
+    // 支持限定列名 table.col 和裸列名 col
+    let bare = col_name.rsplit('.').next().unwrap_or(col_name);
+    let ci = schema.columns.iter()
+        .find(|c| c.name == col_name || c.name == bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
         .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
     row.values.get(ci.index)
         .ok_or_else(|| format!("列 '{}' 没有值", col_name))
@@ -1299,8 +1363,10 @@ fn sort_rows(
 ) -> Result<Vec<Row>, String> {
     let mut sorted = rows.to_vec();
 
-    // 获取列索引
-    let ci = schema.columns.iter().find(|c| c.name == *order_col)
+    // 获取列索引（支持限定列名 table.col 和裸列名 col）
+    let bare = order_col.rsplit('.').next().unwrap_or(order_col);
+    let ci = schema.columns.iter()
+        .find(|c| c.name == *order_col || c.name == *bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
         .ok_or_else(|| format!("排序列 '{}' 不存在", order_col))?;
     let col_idx = ci.index;
 
@@ -2766,6 +2832,183 @@ mod tests {
         match &r[0] {
             ExecuteResult::SelectResult { rows, .. } => {
                 assert_eq!(rows.len(), 3, "4行数据只有3个不同日期");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== JOIN 测试 =====
+
+    fn setup_join_tables(executor: &mut Executor) {
+        // 创建 users 表
+        executor.execute(parse_sql(
+            "CREATE TABLE users (id INTEGER, name TEXT, dept_id INTEGER)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO users (id, name, dept_id) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 10)"
+        ).unwrap()).unwrap();
+
+        // 创建 departments 表
+        executor.execute(parse_sql(
+            "CREATE TABLE departments (id INTEGER, name TEXT)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO departments (id, name) VALUES (10, 'Engineering'), (20, 'Sales'), (30, 'HR')"
+        ).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_inner_join_basic() {
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        let r = executor.execute(parse_sql(
+            "SELECT * FROM users INNER JOIN departments ON users.dept_id = departments.id"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                // users有3列 + departments有2列 = 5列
+                assert_eq!(columns.len(), 5, "JOIN后应有5列（3+2）");
+                // alice→Engineering, bob→Sales, charlie→Engineering
+                // HR(30)无匹配用户
+                assert_eq!(rows.len(), 3, "3个用户都有匹配的部门");
+                // 验证第一行：alice, dept_id=10, Engineering
+                assert_eq!(rows[0][1], "alice");
+                assert_eq!(rows[0][4], "Engineering");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_with_where() {
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        let r = executor.execute(parse_sql(
+            "SELECT * FROM users INNER JOIN departments ON users.dept_id = departments.id WHERE departments.name = 'Engineering'"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows, .. } => {
+                eprintln!("DEBUG WHERE: columns={:?}", columns);
+                eprintln!("DEBUG WHERE: rows.len()={}", rows.len());
+                for (i, row) in rows.iter().enumerate() {
+                    eprintln!("DEBUG WHERE: row[{}]={:?}", i, row);
+                }
+                // Let's also test without WHERE to see the join result
+                let r2 = executor.execute(parse_sql(
+                    "SELECT * FROM users INNER JOIN departments ON users.dept_id = departments.id"
+                ).unwrap()).unwrap();
+                match &r2[0] {
+                    ExecuteResult::SelectResult { rows: rows2, .. } => {
+                        eprintln!("DEBUG NOWHERE: rows.len()={}", rows2.len());
+                        for (i, row) in rows2.iter().enumerate() {
+                            eprintln!("DEBUG NOWHERE: row[{}]={:?}", i, row);
+                        }
+                    }
+                    _ => {}
+                }
+                assert_eq!(rows.len(), 2, "Engineering部门有2人");
+                for row in rows {
+                    assert_eq!(row[4], "Engineering");
+                }
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_with_order_by() {
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        let r = executor.execute(parse_sql(
+            "SELECT * FROM users INNER JOIN departments ON users.dept_id = departments.id ORDER BY users.id DESC"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                // DESC: charlie(3), bob(2), alice(1)
+                assert_eq!(rows[0][1], "charlie");
+                assert_eq!(rows[2][1], "alice");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_no_match() {
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        // HR 部门(id=30)没有用户关联
+        let r = executor.execute(parse_sql(
+            "SELECT * FROM departments INNER JOIN users ON departments.id = users.dept_id WHERE departments.name = 'HR'"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0, "HR部门无关联用户，应返回0行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_with_limit() {
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        let r = executor.execute(parse_sql(
+            "SELECT * FROM users INNER JOIN departments ON users.dept_id = departments.id LIMIT 2"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "LIMIT 2 应返回2行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_column_projection() {
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        // 只选特定列（使用右表的限定列名 departments.name）
+        let r = executor.execute(parse_sql(
+            "SELECT users.name, departments.name FROM users INNER JOIN departments ON users.dept_id = departments.id"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns.len(), 2, "只选2列");
+                assert_eq!(rows.len(), 3);
+                // 验证关联正确性
+                assert_eq!(rows[0][0], "alice");
+                assert_eq!(rows[0][1], "Engineering");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_join_without_inner_keyword() {
+        // 仅 JOIN 也应等同于 INNER JOIN
+        let mut executor = Executor::new();
+        setup_join_tables(&mut executor);
+
+        let r = executor.execute(parse_sql(
+            "SELECT * FROM users JOIN departments ON users.dept_id = departments.id"
+        ).unwrap()).unwrap();
+
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "JOIN 等同于 INNER JOIN");
             }
             _ => panic!("Expected SelectResult"),
         }

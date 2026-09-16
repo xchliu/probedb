@@ -25,6 +25,7 @@ pub enum SQLStatement {
         limit: Option<u64>,
         offset: Option<u64>,
         distinct: bool,
+        join: Option<JoinClause>,
     },
     Delete {
         table_name: String,
@@ -45,6 +46,15 @@ pub enum SQLStatement {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+}
+
+/// JOIN 子句定义
+/// 支持 INNER JOIN table ON table1.col = table2.col
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub table: String,
+    pub left_col: String,
+    pub right_col: String,
 }
 
 /// 解析 SQL 文本（支持 CREATE TABLE / INSERT / SELECT）
@@ -285,8 +295,57 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let mut having = None;
     let mut limit = None;
     let mut offset = None;
+    let mut join: Option<JoinClause> = None;
 
     let mut remaining = rest_after_table.trim().to_string();
+
+    // ===== JOIN 解析 =====
+    // 语法: INNER JOIN table ON left_col = right_col
+    // JOIN 必须在 WHERE 之前解析
+    let upper_check = remaining.to_uppercase();
+    let join_pos = upper_check.find(" INNER JOIN ")
+        .or_else(|| upper_check.find(" JOIN "));
+    if let Some(jpos) = join_pos {
+        // JOIN 关键词前的部分保留为 remaining（供 WHERE 等后续解析）
+        let after_join_kw = if upper_check[jpos..].starts_with(" INNER JOIN ") {
+            remaining[jpos + 12..].trim().to_string()
+        } else {
+            remaining[jpos + 6..].trim().to_string()
+        };
+        // JOIN 后面到 ON 之间是表名
+        let on_pos = after_join_kw.to_uppercase().find(" ON ")
+            .ok_or_else(|| "JOIN 缺少 ON 子句".to_string())?;
+        let join_table = after_join_kw[..on_pos].trim().to_lowercase();
+        let after_on = after_join_kw[on_pos + 4..].trim().to_string();
+        // ON left_col = right_col —— 找到等号
+        // 先找后续子句的开始位置，截取 ON 条件
+        let after_on_upper = after_on.to_uppercase();
+        let on_end = after_on_upper.find(" WHERE ")
+            .or_else(|| after_on_upper.find(" GROUP BY "))
+            .or_else(|| after_on_upper.find(" HAVING "))
+            .or_else(|| after_on_upper.find(" ORDER BY "))
+            .or_else(|| after_on_upper.find(" LIMIT "))
+            .or_else(|| after_on_upper.find(" OFFSET"))
+            .unwrap_or(after_on.len());
+        let on_cond = after_on[..on_end].trim();
+        // 解析 left_col = right_col（只支持等值连接条件）
+        let eq_pos = on_cond.find('=')
+            .ok_or_else(|| format!("JOIN ON 条件缺少等号: {}", on_cond))?;
+        let left_col = on_cond[..eq_pos].trim().to_lowercase();
+        let right_col = on_cond[eq_pos + 1..].trim().to_lowercase();
+        join = Some(JoinClause {
+            table: join_table,
+            left_col,
+            right_col,
+        });
+        // remaining 设为 JOIN 后面的剩余部分（WHERE 等后续子句）
+        if on_end < after_on.len() {
+            remaining = after_on[on_end..].trim().to_string();
+        } else {
+            remaining = String::new();
+        }
+    }
+
     let upper = remaining.to_uppercase();
 
     // WHERE — 处理"WHERE age > 30"开头的情况
@@ -466,6 +525,7 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
         limit,
         offset,
         distinct,
+        join,
     })
 }
 
