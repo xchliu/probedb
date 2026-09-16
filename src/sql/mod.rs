@@ -156,6 +156,9 @@ fn parse_column_def(s: &str) -> Result<ColumnDef, String> {
     }
     let name = parts[0].to_lowercase();
     let type_str = parts[1..].join(" ").to_uppercase();
+    // 基础类型 token（去掉 VECTOR(n) 的括号部分），用于精确匹配 DATE/TIME，
+    // 避免 "DATETIME"/"TIMESTAMP" 被 "DATE"/"TIME" 前缀误吞
+    let base = type_str.split('(').next().unwrap_or("").trim();
 
     let data_type = if type_str.starts_with("INT") {
         DataType::Integer
@@ -163,6 +166,12 @@ fn parse_column_def(s: &str) -> Result<ColumnDef, String> {
         DataType::Float
     } else if type_str.starts_with("TEXT") || type_str.starts_with("VARCHAR") || type_str.starts_with("CHAR") || type_str.starts_with("STRING") {
         DataType::Text
+    } else if type_str.starts_with("BOOL") {
+        DataType::Boolean
+    } else if base == "DATE" {
+        DataType::Date
+    } else if base == "TIME" {
+        DataType::Time
     } else if type_str.starts_with("VECTOR") {
         // 解析 VECTOR(n)
         let dim = if let Some(paren_start) = type_str.find('(') {
@@ -686,6 +695,46 @@ mod tests {
                 assert_eq!(columns[1].data_type, DataType::Vector(3));
             }
             _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_table_boolean_date_time() {
+        let stmts = parse_sql(
+            "CREATE TABLE events (id INTEGER, day DATE, at TIME, done BOOLEAN, active BOOL)",
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::CreateTable { columns, .. } => {
+                assert_eq!(columns[1].data_type, DataType::Date);
+                assert_eq!(columns[2].data_type, DataType::Time);
+                assert_eq!(columns[3].data_type, DataType::Boolean);
+                assert_eq!(columns[4].data_type, DataType::Boolean, "BOOL 是 BOOLEAN 别名");
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_table_datetime_is_not_date() {
+        // 精确匹配保护：DATETIME 未被 DATE 前缀吞掉，明确报错而不是静默当 DATE 用
+        let err = parse_sql("CREATE TABLE t (id INTEGER, ts DATETIME)").unwrap_err();
+        assert!(err.contains("不支持的数据类型"), "实际错误: {}", err);
+        let err2 = parse_sql("CREATE TABLE t (id INTEGER, ts TIMESTAMP)").unwrap_err();
+        assert!(err2.contains("不支持的数据类型"), "实际错误: {}", err2);
+    }
+
+    #[test]
+    fn test_parse_select_with_new_type_filters() {
+        let stmts = parse_sql(
+            "SELECT * FROM events WHERE day > '2026-01-01' AND done = true",
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Select { where_clause, .. } => {
+                let wc = where_clause.as_ref().unwrap();
+                assert!(wc.contains("day > '2026-01-01'"));
+                assert!(wc.contains("done = true"));
+            }
+            _ => panic!("Expected Select"),
         }
     }
 

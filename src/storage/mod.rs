@@ -310,6 +310,9 @@ pub(crate) fn encode_type(t: &DataType) -> String {
         DataType::Integer => "INTEGER".to_string(),
         DataType::Float => "FLOAT".to_string(),
         DataType::Text => "TEXT".to_string(),
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Date => "DATE".to_string(),
+        DataType::Time => "TIME".to_string(),
         DataType::Vector(dim) => format!("VECTOR:{}", dim),
     }
 }
@@ -345,6 +348,9 @@ pub(crate) fn decode_type(s: &str) -> Result<DataType, String> {
         "INTEGER" => Ok(DataType::Integer),
         "FLOAT" => Ok(DataType::Float),
         "TEXT" => Ok(DataType::Text),
+        "BOOLEAN" => Ok(DataType::Boolean),
+        "DATE" => Ok(DataType::Date),
+        "TIME" => Ok(DataType::Time),
         other if other.starts_with("VECTOR:") => {
             let dim: usize = other[7..].parse()
                 .map_err(|_| format!("VECTOR维度解析失败: {}", other))?;
@@ -360,6 +366,9 @@ pub(crate) fn encode_value(v: &Value) -> String {
         Value::Integer(n) => format!("INT:{}", n),
         Value::Float(f) => format!("FLOAT:{}", f),
         Value::Text(s) => format!("TEXT:{}", escape_text(s)),
+        Value::Boolean(b) => format!("BOOL:{}", if *b { "true" } else { "false" }),
+        Value::Date(d) => format!("DATE:{}", d),
+        Value::Time(t) => format!("TIME:{}", t),
         Value::Vector(vec) => {
             let dims: Vec<String> = vec.iter().map(|x| x.to_string()).collect();
             format!("VEC:{}:{}", vec.len(), dims.join(","))
@@ -379,6 +388,21 @@ pub(crate) fn decode_value(s: &str) -> Result<Value, String> {
     }
     if let Some(rest) = s.strip_prefix("TEXT:") {
         return Ok(Value::Text(unescape_text(rest)));
+    }
+    if let Some(rest) = s.strip_prefix("BOOL:") {
+        let lower = rest.trim().to_lowercase();
+        return match lower.as_str() {
+            "true" => Ok(Value::Boolean(true)),
+            "false" => Ok(Value::Boolean(false)),
+            _ => Err(format!("布尔值解析失败: {}", s)),
+        };
+    }
+    // DATE/TIME 解码时重新校验 —— 快照被改写/损坏时明确报错，而不是把脏数据放进内存
+    if let Some(rest) = s.strip_prefix("DATE:") {
+        return crate::types::normalize_date(rest).map(Value::Date);
+    }
+    if let Some(rest) = s.strip_prefix("TIME:") {
+        return crate::types::normalize_time(rest).map(Value::Time);
     }
     if let Some(rest) = s.strip_prefix("VEC:") {
         let (len_str, nums_str) = rest.split_once(':')
@@ -453,6 +477,9 @@ fn type_matches(col_type: &DataType, value: &Value) -> bool {
         (DataType::Float, Value::Float(_))
         | (DataType::Float, Value::Integer(_)) => true, // Integer 可以隐式转 Float
         (DataType::Text, Value::Text(_)) => true,
+        (DataType::Boolean, Value::Boolean(_)) => true,
+        (DataType::Date, Value::Date(_)) => true,
+        (DataType::Time, Value::Time(_)) => true,
         (DataType::Vector(dim), Value::Vector(v)) => {
             if *dim == 0 {
                 true // 不限制维度
@@ -482,6 +509,17 @@ pub fn parse_value(value_str: &str, col_type: &DataType) -> Result<Value, String
             let s = value_str.trim_matches('\'');
             Ok(Value::Text(s.to_string()))
         }
+        DataType::Boolean => {
+            // 接受 true/false（大小写不敏感）与 1/0 两种写法
+            let s = value_str.trim().trim_matches('\'');
+            match s.to_lowercase().as_str() {
+                "true" | "1" => Ok(Value::Boolean(true)),
+                "false" | "0" => Ok(Value::Boolean(false)),
+                _ => Err(format!("无法解析为布尔值(true/false): {}", value_str)),
+            }
+        }
+        DataType::Date => crate::types::normalize_date(value_str).map(Value::Date),
+        DataType::Time => crate::types::normalize_time(value_str).map(Value::Time),
         DataType::Vector(_) => {
             // 解析向量格式: [1.0,2.0,3.0] 或 1.0,2.0,3.0
             let trimmed = value_str.trim_matches('[').trim_matches(']');
@@ -611,5 +649,145 @@ mod tests {
             Value::Integer(30),
         ]).unwrap();
         engine
+    }
+
+    // ===== BOOLEAN / DATE / TIME 存储层 =====
+
+    #[test]
+    fn test_type_encoding_roundtrip() {
+        for t in [
+            DataType::Integer,
+            DataType::Float,
+            DataType::Text,
+            DataType::Boolean,
+            DataType::Date,
+            DataType::Time,
+            DataType::Vector(128),
+        ] {
+            let encoded = encode_type(&t);
+            assert_eq!(decode_type(&encoded).unwrap(), t, "类型 {} 往返失败", encoded);
+        }
+    }
+
+    #[test]
+    fn test_value_encoding_roundtrip_new_types() {
+        let values = vec![
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Date("2026-09-16".to_string()),
+            Value::Time("14:00:00".to_string()),
+        ];
+        for v in values {
+            let encoded = encode_value(&v);
+            assert_eq!(decode_value(&encoded).unwrap(), v, "值 {} 往返失败", encoded);
+        }
+    }
+
+    #[test]
+    fn test_decode_value_rejects_corrupted_temporal() {
+        // 快照被改写 → 明确报错，不把脏数据放进内存
+        assert!(decode_value("DATE:2026-02-30").is_err(), "非法日期应拒绝");
+        assert!(decode_value("DATE:not-a-date").is_err());
+        assert!(decode_value("TIME:25:00:00").is_err(), "非法时间应拒绝");
+        assert!(decode_value("BOOL:maybe").is_err());
+    }
+
+    #[test]
+    fn test_type_matches_new_types() {
+        assert!(type_matches(&DataType::Boolean, &Value::Boolean(true)));
+        assert!(type_matches(&DataType::Date, &Value::Date("2026-09-16".into())));
+        assert!(type_matches(&DataType::Time, &Value::Time("14:00:00".into())));
+        // 跨类型必须拒绝（这是类型系统存在的意义）
+        assert!(!type_matches(&DataType::Boolean, &Value::Integer(1)));
+        assert!(!type_matches(&DataType::Boolean, &Value::Text("true".into())));
+        assert!(!type_matches(&DataType::Date, &Value::Text("2026-09-16".into())));
+        assert!(!type_matches(&DataType::Date, &Value::Time("14:00:00".into())));
+        assert!(!type_matches(&DataType::Text, &Value::Date("2026-09-16".into())));
+    }
+
+    #[test]
+    fn test_parse_value_boolean_variants() {
+        assert_eq!(parse_value("true", &DataType::Boolean).unwrap(), Value::Boolean(true));
+        assert_eq!(parse_value("TRUE", &DataType::Boolean).unwrap(), Value::Boolean(true));
+        assert_eq!(parse_value("'false'", &DataType::Boolean).unwrap(), Value::Boolean(false));
+        assert_eq!(parse_value("1", &DataType::Boolean).unwrap(), Value::Boolean(true));
+        assert_eq!(parse_value("0", &DataType::Boolean).unwrap(), Value::Boolean(false));
+        assert!(parse_value("yes", &DataType::Boolean).is_err());
+        assert!(parse_value("", &DataType::Boolean).is_err());
+    }
+
+    #[test]
+    fn test_parse_value_date_time_normalizes() {
+        assert_eq!(
+            parse_value("'2026-09-16'", &DataType::Date).unwrap(),
+            Value::Date("2026-09-16".to_string())
+        );
+        assert_eq!(
+            parse_value("2026-9-16", &DataType::Date).is_err(),
+            true,
+            "非零填充应报错"
+        );
+        assert_eq!(
+            parse_value("'14:30'", &DataType::Time).unwrap(),
+            Value::Time("14:30:00".to_string())
+        );
+        assert!(parse_value("25:00", &DataType::Time).is_err());
+    }
+
+    #[test]
+    fn test_temporal_columns_survive_state_export_import() {
+        let schema = TableSchema {
+            name: "events".to_string(),
+            columns: vec![
+                ColumnInfo { name: "id".to_string(), data_type: DataType::Integer, index: 0 },
+                ColumnInfo { name: "day".to_string(), data_type: DataType::Date, index: 1 },
+                ColumnInfo { name: "at".to_string(), data_type: DataType::Time, index: 2 },
+                ColumnInfo { name: "done".to_string(), data_type: DataType::Boolean, index: 3 },
+            ],
+        };
+        let mut engine = StorageEngine::new();
+        engine.create_table(schema).unwrap();
+        engine.insert("events", vec![
+            Value::Integer(1),
+            Value::Date("2026-09-16".to_string()),
+            Value::Time("14:00:00".to_string()),
+            Value::Boolean(true),
+        ]).unwrap();
+
+        let state = engine.export_state();
+        let mut restored = StorageEngine::new();
+        restored.import_state(&state).unwrap();
+
+        let rows = restored.scan_table("events").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1], Value::Date("2026-09-16".to_string()));
+        assert_eq!(rows[0].values[2], Value::Time("14:00:00".to_string()));
+        assert_eq!(rows[0].values[3], Value::Boolean(true));
+        // schema 类型也要还原
+        let rs = restored.get_schema("events").unwrap();
+        assert_eq!(rs.columns[1].data_type, DataType::Date);
+        assert_eq!(rs.columns[3].data_type, DataType::Boolean);
+    }
+
+    #[test]
+    fn test_tampered_date_in_snapshot_is_rejected() {
+        let mut engine = StorageEngine::new();
+        engine.create_table(TableSchema {
+            name: "events".to_string(),
+            columns: vec![
+                ColumnInfo { name: "id".to_string(), data_type: DataType::Integer, index: 0 },
+                ColumnInfo { name: "day".to_string(), data_type: DataType::Date, index: 1 },
+            ],
+        }).unwrap();
+        engine.insert("events", vec![
+            Value::Integer(1),
+            Value::Date("2026-02-28".to_string()),
+        ]).unwrap();
+
+        // 篡改为不存在的日期（2026-02-30）
+        let tampered = engine.export_state().replace("DATE:2026-02-28", "DATE:2026-02-30");
+        let mut restored = StorageEngine::new();
+        let result = restored.import_state(&tampered);
+        assert!(result.is_err(), "快照中的非法日期应被拒绝");
     }
 }

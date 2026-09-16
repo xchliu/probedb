@@ -4,6 +4,59 @@
 
 ---
 
+## 2026-09-16
+
+### 完成
+- **数据类型系统补全：BOOLEAN / DATE / TIME**（项目目标 MVP 清单中列出但此前未实现的三类）
+  - 类型系统：`DataType` 新增 `Boolean`/`Date`/`Time`；`Value` 新增 `Boolean(bool)`/`Date(String)`/`Time(String)`
+  - DATE/TIME 内部按 **ISO 8601 规范化字符串**存储（`YYYY-MM-DD` / `HH:MM:SS`）
+  - 新增零依赖校验函数：`normalize_date()` / `normalize_time()` / `is_leap_year()` / `days_in_month()`
+    - 日期：严格零填充格式 + 年/月/日范围 + **闰年规则**（4年一闰/100年不闰/400年再闰）
+    - 时间：`HH:MM:SS` 或 `HH:MM`（秒补零）+ 时/分/秒范围
+  - 非法值**明确报错**而非静默写入：`2026-02-30`、`2025-02-29`、`2026-13-45`、`25:00:00` 全部拒绝
+  - SQL 解析器：`CREATE TABLE` 识别 `BOOLEAN`/`BOOL`（别名）/`DATE`/`TIME`
+    - DATE/TIME 用**精确 token 匹配**，避免 `DATETIME`/`TIMESTAMP` 被前缀误吞（当前明确报"不支持的数据类型"）
+  - 执行器：`compare_values()` 新增布尔/日期/时间比较分支
+    - `false < true`（布尔可 ORDER BY）；布尔与 `1/0` 数字互通（SQLite 兼容语义）
+    - DATE/TIME 字典序 == 时间序，可直接与字符串字面量比较（`WHERE due > '2026-01-01'`）
+    - `parse_literal()` 识别裸词 `true`/`false`
+    - LIKE 支持新类型（转字符串匹配）
+  - 持久化：`encode_type`/`decode_type`/`encode_value`/`decode_value` 全链路支持
+    - 编码格式：`DATE:2026-09-16` / `TIME:14:00:00` / `BOOL:true`
+    - **解码时重新校验**：快照被改写为非法日期/时间 → 明确报错（不让脏数据进内存）
+  - 修复：INSERT 解析错误不再吞掉底层原因，错误信息带上具体原因
+    （原 `无法解析列 'd' 的值: 2026-13-45` → 现 `无法解析列 'd' 的值 '2026-13-45': 日期月份超出范围(1-12)`）
+
+### 测试
+- 155 passed, 0 failed（124→155，新增 31 个）
+- types：test_normalize_date_valid / _rejects_invalid / test_normalize_date_leap_year / test_normalize_time_valid / _rejects_invalid / test_iso_date_string_order_equals_chronological_order / test_boolean_and_temporal_display
+- storage：test_type_encoding_roundtrip / test_value_encoding_roundtrip_new_types / test_decode_value_rejects_corrupted_temporal / test_type_matches_new_types / test_parse_value_boolean_variants / test_parse_value_date_time_normalizes / test_temporal_columns_survive_state_export_import / test_tampered_date_in_snapshot_is_rejected
+- sql：test_parse_create_table_boolean_date_time / test_parse_create_table_datetime_is_not_date / test_parse_select_with_new_type_filters
+- executor：test_boolean_insert_and_select / test_boolean_where_filter / test_boolean_where_equality_is_not_always_true / test_boolean_order_by / test_date_range_filter / test_date_order_by_is_chronological / test_time_column_and_filter / test_invalid_date_insert_is_rejected / test_boolean_update_and_delete / test_new_types_with_group_by_and_aggregate / test_date_distinct
+- lib（端到端持久化）：test_probedb_temporal_types_persist_reload / test_probedb_invalid_date_rejected_end_to_end
+
+### 决策
+- **DATE/TIME 存规范化 ISO 字符串，而非 epoch 整数**：
+  1. 零填充 ISO 8601 的**字典序严格等于时间序**（已用测试固化），`WHERE/ORDER BY/GROUP BY/DISTINCT` 全部天然正确，无需日期运算库
+  2. 快照文本协议可读，出问题能直接肉眼查（对端侧调试价值高）
+  3. 零外部依赖铁律下代码量最小
+  4. 有 SQLite 先例；代价是放弃了未来 `DATE + INTERVAL` 类日期算术（届时可改为数值存储 + 迁移）
+- **DATE 必须是真类型而非 TEXT 别名**：靠写入时格式+范围+闰年三重校验获得语义保证，这是 DATE 区别于 TEXT 的价值所在
+- **BOOLEAN 接受 `1/0`**：与整数语义互通降低使用摩擦，且比较层显式支持 Boolean↔Integer
+- **DATETIME/TIMESTAMP 明确不支持**：不在 MVP 清单内，用精确匹配拒绝而非静默降级为 DATE（静默降级是更糟的失败模式）
+- 不依赖 Hermes 接入决策，自主推进（待确认事项仍是 Hermes 切入点与 C ABI 确认）
+
+### 已知遗留（候选下一任务）
+- `compare_values()` 的 `_ => Equal` 兜底：**类型不匹配的比较**（如 `TEXT 列 = 123`、`布尔列 = 1.5`）会走 Equal 分支，导致 `=` 误判为真、`>=` 误判为真。今日新增类型都有显式分支，现实用法正确；但**类型安全比较语义**（不匹配即不命中）需要单独一次重构，涉及 SQL 类型强制转换规则，值得独立设计
+- `DATETIME`/`TIMESTAMP` 若要支持，需扩展为 `YYYY-MM-DD HH:MM:SS` 组合类型
+
+### 文档更新
+- [x] 周计划更新
+- [x] 开发日志更新
+- [ ] 项目目标文档更新（MVP 数据类型清单已全部实现，可在坦哥确认后勾掉 DATE/TIME/BOOLEAN）
+
+---
+
 ## 2026-09-15
 
 ### 完成

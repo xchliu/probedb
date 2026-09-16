@@ -658,4 +658,79 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}.wal", p));
         }
     }
+
+    #[test]
+    fn test_probedb_temporal_types_persist_reload() {
+        // 端到端：BOOLEAN/DATE/TIME 建表 → 写入 → 落盘 → 重开 → 查询/范围过滤
+        let path = temp_db_path("probedb_temporal_test.pdb");
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute(
+                "CREATE TABLE memories (id INTEGER, content TEXT, created_date DATE, created_time TIME, pinned BOOLEAN)"
+            ).is_ok(), "含新类型的建表应成功");
+            assert!(db.execute(
+                "INSERT INTO memories (id, content, created_date, created_time, pinned) VALUES \
+                 (1, 'm1', '2026-01-10', '08:00:00', true), \
+                 (2, 'm2', '2026-06-20', '12:30:00', false), \
+                 (3, 'm3', '2026-09-16', '19:45:00', true)"
+            ).is_ok());
+            db.persist().unwrap();
+        }
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            // 落盘重开后：布尔过滤仍生效
+            let r = db.execute("SELECT id FROM memories WHERE pinned = true").unwrap();
+            assert!(r.contains("2 行"), "pinned=true 应命中2行, 实际: {}", r);
+
+            // 日期范围过滤（Hermes 记忆的典型查询）
+            let r2 = db.execute("SELECT content FROM memories WHERE created_date >= '2026-06-01'").unwrap();
+            assert!(r2.contains("m2") && r2.contains("m3"), "日期范围过滤应命中 m2/m3, 实际: {}", r2);
+            assert!(!r2.contains("m1"), "m1 应被日期范围排除");
+
+            // 日期排序
+            let r3 = db.execute("SELECT created_date FROM memories ORDER BY created_date DESC").unwrap();
+            let first_line = r3.lines().find(|l| l.contains("2026-")).unwrap_or("");
+            assert!(first_line.contains("2026-09-16"), "DESC 排序首行应为最新日期, 实际: {}", r3);
+
+            db.persist().unwrap();
+        }
+
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+    }
+
+    #[test]
+    fn test_probedb_invalid_date_rejected_end_to_end() {
+        let path = temp_db_path("probedb_bad_date_test.pdb");
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+
+        let mut db = ProbeDB::open(&path).unwrap();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, d DATE)").is_ok());
+        let err = db.execute("INSERT INTO t (id, d) VALUES (1, '2026-13-45')").unwrap_err();
+        assert!(err.contains("日期") || err.contains("超出范围"), "应给出日期错误提示, 实际: {}", err);
+
+        // 非法值不应被写入
+        let r = db.execute("SELECT id FROM t").unwrap();
+        assert!(r.contains("0 行"), "非法日期不应写入任何行, 实际: {}", r);
+
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+    }
 }

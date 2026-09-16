@@ -91,8 +91,9 @@ impl Executor {
                     for (i, val_str) in row_values.iter().enumerate() {
                         if i >= col_types.len() { break; }
                         let clean = val_str.trim_matches('\'');
+                        // 保留底层解析原因（格式错误/日期越界/类型不符），否则用户只看到"无法解析"
                         let value = parse_value(clean, &col_types[i])
-                            .map_err(|_| format!("无法解析列 '{}' 的值: {}", col_names[i], clean))?;
+                            .map_err(|e| format!("无法解析列 '{}' 的值 '{}': {}", col_names[i], clean, e))?;
                         parsed.push(value);
                     }
                     Ok(parsed)
@@ -902,12 +903,18 @@ fn get_column_value<'a>(row: &'a Row, col_name: &str, schema: &TableSchema) -> R
         .ok_or_else(|| format!("列 '{}' 没有值", col_name))
 }
 
-/// 解析一个字面量值（数字、字符串、浮点数）
+/// 解析一个字面量值（数字、字符串、布尔、浮点数）
 fn parse_literal(s: &str) -> Value {
     let s = s.trim();
     // 字符串（带引号）
     if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
         return Value::Text(s[1..s.len()-1].to_string());
+    }
+    // 布尔字面量（裸词 true/false，大小写不敏感）
+    match s.to_lowercase().as_str() {
+        "true" => return Value::Boolean(true),
+        "false" => return Value::Boolean(false),
+        _ => {}
     }
     // 浮点数
     if s.contains('.') {
@@ -934,6 +941,25 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Integer(ai), Value::Float(bf)) => (*ai as f64).partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Float(af), Value::Integer(bi)) => af.partial_cmp(&(*bi as f64)).unwrap_or(std::cmp::Ordering::Equal),
         (Value::Text(at), Value::Text(bt)) => at.cmp(bt),
+        // 布尔：false < true（ORDER BY 可排序）；与 1/0 数字字面量互通（SQLite 兼容语义）
+        (Value::Boolean(ab), Value::Boolean(bb)) => ab.cmp(bb),
+        (Value::Boolean(ab), Value::Integer(bi)) => (*ab as i64).cmp(bi),
+        (Value::Integer(ai), Value::Boolean(bb)) => ai.cmp(&(*bb as i64)),
+        (Value::Boolean(ab), Value::Text(bt)) => {
+            let a_str = if *ab { "true" } else { "false" };
+            a_str.cmp(bt.as_str())
+        }
+        (Value::Text(at), Value::Boolean(bb)) => {
+            let b_str = if *bb { "true" } else { "false" };
+            at.as_str().cmp(b_str)
+        }
+        // DATE/TIME 内部为规范化 ISO 字符串 → 字典序即时间序；也允许与字符串字面量比较
+        (Value::Date(ad), Value::Date(bd)) => ad.cmp(bd),
+        (Value::Time(at), Value::Time(bt)) => at.cmp(bt),
+        (Value::Date(ad), Value::Text(bt)) => ad.cmp(bt),
+        (Value::Text(at), Value::Date(bd)) => at.cmp(bd),
+        (Value::Time(at), Value::Text(bt)) => at.cmp(bt),
+        (Value::Text(at), Value::Time(bt)) => at.cmp(bt),
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -957,6 +983,9 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
             Value::Text(t) => t.clone(),
             Value::Integer(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
+            Value::Boolean(b) => b.to_string(),
+            Value::Date(d) => d.clone(),
+            Value::Time(t) => t.clone(),
             Value::Vector(_) => return Ok(false),
         };
         return Ok(like_match(&text, pattern));
@@ -2479,6 +2508,264 @@ mod tests {
         match &results[0] {
             ExecuteResult::SelectResult { rows, .. } => {
                 assert_eq!(rows.len(), 0, "空表 HAVING 应返回0行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== BOOLEAN / DATE / TIME 端到端 =====
+
+    /// 建一张含三种新类型的表
+    fn setup_typed_table(executor: &mut Executor) {
+        executor.execute(parse_sql(
+            "CREATE TABLE tasks (id INTEGER, title TEXT, due DATE, at TIME, done BOOLEAN)",
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO tasks (id, title, due, at, done) VALUES \
+             (1, 'alpha', '2026-01-15', '09:00:00', false), \
+             (2, 'beta', '2026-03-02', '14:30:00', true), \
+             (3, 'gamma', '2025-12-31', '23:59:59', false), \
+             (4, 'delta', '2026-03-02', '08:00:00', true)",
+        ).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_boolean_insert_and_select() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        let results = executor.execute(parse_sql("SELECT id, title, done FROM tasks").unwrap()).unwrap();
+        match &results[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["id".to_string(), "title".to_string(), "done".to_string()]);
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0][2], "false", "BOOL 输出应为 true/false");
+                assert_eq!(rows[1][2], "true");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_boolean_where_filter() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        // WHERE done = true （裸布尔字面量）
+        let r = executor.execute(parse_sql("SELECT id FROM tasks WHERE done = true").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "done=true 应有2行");
+                assert_eq!(rows[0][0], "2");
+                assert_eq!(rows[1][0], "4");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // WHERE done = false
+        let r2 = executor.execute(parse_sql("SELECT id FROM tasks WHERE done = false").unwrap()).unwrap();
+        match &r2[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "done=false 应有2行");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_boolean_where_equality_is_not_always_true() {
+        // 回归保护：类型不匹配时 `=` 不能退化成恒真
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        // 全部都是 false 的行查询 done = true，必须返回 0 行
+        let r = executor.execute(parse_sql("SELECT id FROM tasks WHERE done = true AND title = 'nonexistent'").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_boolean_order_by() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        // false < true，升序时 false 在前
+        let r = executor.execute(parse_sql("SELECT id, done FROM tasks ORDER BY done ASC").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][1], "false");
+                assert_eq!(rows[1][1], "false");
+                assert_eq!(rows[2][1], "true");
+                assert_eq!(rows[3][1], "true");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_date_range_filter() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        let r = executor.execute(parse_sql("SELECT id, due FROM tasks WHERE due > '2026-01-01'").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "2026-01-01 之后应有3行（1/15、3/2、3/2）");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // 跨年边界：2025-12-31 必须被排除
+        let r2 = executor.execute(parse_sql("SELECT id FROM tasks WHERE due >= '2025-12-31' AND due <= '2026-01-15'").unwrap()).unwrap();
+        match &r2[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "闭区间应含 2025-12-31 与 2026-01-15");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_date_order_by_is_chronological() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        let r = executor.execute(parse_sql("SELECT due FROM tasks ORDER BY due ASC").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                let dues: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+                assert_eq!(dues, vec!["2025-12-31", "2026-01-15", "2026-03-02", "2026-03-02"],
+                    "DATE 字典序必须等于时间序");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let r2 = executor.execute(parse_sql("SELECT due FROM tasks ORDER BY due DESC").unwrap()).unwrap();
+        match &r2[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "2026-03-02");
+                assert_eq!(rows[3][0], "2025-12-31");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_time_column_and_filter() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        // HH:MM 应被规范化为 HH:MM:SS
+        let r = executor.execute(parse_sql("SELECT at FROM tasks WHERE id = 2").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "14:30:00");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let r2 = executor.execute(parse_sql("SELECT id FROM tasks WHERE at < '12:00:00'").unwrap()).unwrap();
+        match &r2[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "12点前应有2行（09:00、08:00）");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_date_insert_is_rejected() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, d DATE)").unwrap()).unwrap();
+
+        // 不存在的日期 → 报错，不静默写入
+        let r = executor.execute(parse_sql("INSERT INTO t (id, d) VALUES (1, '2026-02-30')").unwrap());
+        assert!(r.is_err(), "非法日期应拒绝插入");
+
+        let r2 = executor.execute(parse_sql("INSERT INTO t (id, d) VALUES (1, '2026/02/28')").unwrap());
+        assert!(r2.is_err(), "错误格式应拒绝插入");
+
+        let r3 = executor.execute(parse_sql("INSERT INTO t (id, d) VALUES (1, '2025-02-29')").unwrap());
+        assert!(r3.is_err(), "平年2月29日应拒绝插入");
+
+        // 合法值可写入
+        executor.execute(parse_sql("INSERT INTO t (id, d) VALUES (1, '2024-02-29')").unwrap()).unwrap();
+        let r4 = executor.execute(parse_sql("SELECT d FROM t").unwrap()).unwrap();
+        match &r4[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows[0][0], "2024-02-29"),
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_boolean_update_and_delete() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        // UPDATE 布尔列
+        executor.execute(parse_sql("UPDATE tasks SET done = true WHERE id = 1").unwrap()).unwrap();
+        let r = executor.execute(parse_sql("SELECT done FROM tasks WHERE id = 1").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows[0][0], "true"),
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // UPDATE 日期列
+        executor.execute(parse_sql("UPDATE tasks SET due = '2027-07-04' WHERE id = 3").unwrap()).unwrap();
+        let r2 = executor.execute(parse_sql("SELECT due FROM tasks WHERE id = 3").unwrap()).unwrap();
+        match &r2[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows[0][0], "2027-07-04"),
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // DELETE 按布尔条件
+        // 注意：id=1 已被上面的 UPDATE 改成 done=true，此时 done=false 只剩 id=3
+        let r3 = executor.execute(parse_sql("DELETE FROM tasks WHERE done = false").unwrap()).unwrap();
+        match &r3[0] {
+            ExecuteResult::Deleted { count } => assert_eq!(*count, 1, "应有1行 done=false 被删除（id=1 已改为 true）"),
+            _ => panic!("Expected Deleted"),
+        }
+    }
+
+    #[test]
+    fn test_new_types_with_group_by_and_aggregate() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        // 按布尔列分组计数 —— 新类型能作为分组键
+        let r = executor.execute(parse_sql("SELECT done, COUNT(*) FROM tasks GROUP BY done").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 2, "done 应分成两组");
+                let counts: Vec<&str> = rows.iter().map(|row| row[1].as_str()).collect();
+                assert!(counts.contains(&"2"), "每组各2行, 实际: {:?}", counts);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // 按日期分组 —— 3/2 两行应归为一组
+        let r2 = executor.execute(parse_sql("SELECT due, COUNT(*) FROM tasks GROUP BY due").unwrap()).unwrap();
+        match &r2[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "3个不同日期应有3组");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_date_distinct() {
+        let mut executor = Executor::new();
+        setup_typed_table(&mut executor);
+
+        let r = executor.execute(parse_sql("SELECT DISTINCT due FROM tasks").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3, "4行数据只有3个不同日期");
             }
             _ => panic!("Expected SelectResult"),
         }
