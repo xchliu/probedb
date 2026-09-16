@@ -18,6 +18,17 @@ fn main() {
         "CREATE TABLE items (id INTEGER, embedding VECTOR(3))",
         "INSERT INTO items (id, embedding) VALUES (1, '[0.1,0.2,0.3]')",
         "SELECT id, embedding FROM items",
+        // 数据类型补全演示：BOOLEAN / DATE / TIME
+        "CREATE TABLE memories (id INTEGER, content TEXT, created_date DATE, created_time TIME, pinned BOOLEAN)",
+        "INSERT INTO memories (id, content, created_date, created_time, pinned) \
+         VALUES (1, '上周和坦哥讨论了ProbeDB定位', '2026-09-10', '14:30', true), \
+                (2, '会议纪要待整理', '2026-06-20', '09:00', false), \
+                (3, 'HAVING子句已完成', '2026-09-15', '19:45', true)",
+        "SELECT id, content, created_date, pinned FROM memories WHERE created_date >= '2026-09-01' AND pinned = true",
+        "SELECT id, content, pinned FROM memories ORDER BY pinned DESC",
+        "SELECT id, content, created_date FROM memories ORDER BY created_date DESC",
+        "SELECT pinned, COUNT(*) FROM memories GROUP BY pinned",
+        "INSERT INTO memories (id, content, created_date, created_time, pinned) VALUES (4, '非法日期', '2026-02-30', '10:00', false)",
     ];
 
     for sql in sqls {
