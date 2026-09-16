@@ -347,9 +347,14 @@ impl Executor {
                             }
                         } else {
                             // 支持限定列名 table.col 和裸列名 col
+                            // 优先精确匹配，避免 JOIN 后右表限定列名误命中左表裸列名
                             let bare = col_name.rsplit('.').next().unwrap_or(col_name);
                             let ci = schema.columns.iter()
-                                .find(|c| c.name == *col_name || c.name == *bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
+                                .find(|c| c.name == *col_name)
+                                .or_else(|| {
+                                    schema.columns.iter()
+                                        .find(|c| c.name == *bare || (c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare))
+                                })
                                 .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
                             idxs.push(ci.index);
                             names.push(ci.name.clone());
@@ -959,9 +964,15 @@ fn parse_order_by_str(order_by: &str) -> (String, bool) {
 
 fn get_column_value<'a>(row: &'a Row, col_name: &str, schema: &TableSchema) -> Result<&'a Value, String> {
     // 支持限定列名 table.col 和裸列名 col
+    // 优先精确匹配（table.col），找不到再用裸列名模糊匹配
+    // 这避免了 JOIN 后 "departments.name" 误命中左表 "name" 列
     let bare = col_name.rsplit('.').next().unwrap_or(col_name);
     let ci = schema.columns.iter()
-        .find(|c| c.name == col_name || c.name == bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
+        .find(|c| c.name == col_name)
+        .or_else(|| {
+            schema.columns.iter()
+                .find(|c| c.name == bare || (c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare))
+        })
         .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
     row.values.get(ci.index)
         .ok_or_else(|| format!("列 '{}' 没有值", col_name))
