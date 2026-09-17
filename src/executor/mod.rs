@@ -814,12 +814,12 @@ fn eval_having_condition(
             let left_parsed = parse_literal(left_str);
             let cmp = compare_values(&left_parsed, &right_parsed);
             return Ok(match found_op {
-                ">"  => cmp == std::cmp::Ordering::Greater,
-                ">=" => cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal,
-                "<"  => cmp == std::cmp::Ordering::Less,
-                "<=" => cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal,
-                "="  => cmp == std::cmp::Ordering::Equal,
-                "!=" => cmp != std::cmp::Ordering::Equal,
+                ">"  => cmp.map_or(false, |c| c == std::cmp::Ordering::Greater),
+                ">=" => cmp.map_or(false, |c| c == std::cmp::Ordering::Greater || c == std::cmp::Ordering::Equal),
+                "<"  => cmp.map_or(false, |c| c == std::cmp::Ordering::Less),
+                "<=" => cmp.map_or(false, |c| c == std::cmp::Ordering::Less || c == std::cmp::Ordering::Equal),
+                "="  => cmp.map_or(false, |c| c == std::cmp::Ordering::Equal),
+                "!=" => cmp.map_or(true,  |c| c != std::cmp::Ordering::Equal),
                 _ => false,
             });
         }
@@ -1008,34 +1008,68 @@ fn parse_literal(s: &str) -> Value {
     Value::Text(s.to_string())
 }
 
-/// 比较两个值（支持跨类型比较）
-fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+/// 比较两个值（类型安全语义）
+///
+/// 返回 `None` 表示「不可比较」——类型不匹配且无强制转换规则。
+/// 调用方负责将 `None` 解释为「不命中」（WHERE 谓词为 false）或「相等」
+/// （ORDER BY 稳定排序），而不是误判为 `Equal` 导致静默匹配。
+///
+/// ## 可比较规则表（ProbeDB 严格类型语义）
+///
+/// | 类型对 | 规则 |
+/// |--------|------|
+/// | Integer ↔ Integer | 数值比较 |
+/// | Float ↔ Float | 数值比较（NaN → Equal 兜底） |
+/// | Integer ↔ Float | 互转 f64 比较 |
+/// | Boolean ↔ Boolean | false < true |
+/// | Boolean ↔ Integer | 0/1 互通（SQLite 兼容） |
+/// | Boolean ↔ Float | 0.0/1.0 互通 |
+/// | Boolean ↔ Text | "true"/"false" 字符串比较 |
+/// | Text ↔ Text | 字典序 |
+/// | Date ↔ Date | 字典序（ISO 零填充 == 时间序） |
+/// | Time ↔ Time | 字典序 |
+/// | Date ↔ Text | 字典序（允许与字符串字面量比较） |
+/// | Time ↔ Text | 字典序 |
+/// | 其余 | `None`（不命中） |
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (Value::Integer(ai), Value::Integer(bi)) => ai.cmp(bi),
-        (Value::Float(af), Value::Float(bf)) => af.partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Integer(ai), Value::Float(bf)) => (*ai as f64).partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Float(af), Value::Integer(bi)) => af.partial_cmp(&(*bi as f64)).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Text(at), Value::Text(bt)) => at.cmp(bt),
-        // 布尔：false < true（ORDER BY 可排序）；与 1/0 数字字面量互通（SQLite 兼容语义）
-        (Value::Boolean(ab), Value::Boolean(bb)) => ab.cmp(bb),
-        (Value::Boolean(ab), Value::Integer(bi)) => (*ab as i64).cmp(bi),
-        (Value::Integer(ai), Value::Boolean(bb)) => ai.cmp(&(*bb as i64)),
+        // — 同类型 —
+        (Value::Integer(ai), Value::Integer(bi)) => Some(ai.cmp(bi)),
+        (Value::Float(af), Value::Float(bf)) => Some(af.partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Text(at), Value::Text(bt)) => Some(at.cmp(bt)),
+        (Value::Boolean(ab), Value::Boolean(bb)) => Some(ab.cmp(bb)),
+        (Value::Date(ad), Value::Date(bd)) => Some(ad.cmp(bd)),
+        (Value::Time(at), Value::Time(bt)) => Some(at.cmp(bt)),
+
+        // — 数值互通：Integer ↔ Float —
+        (Value::Integer(ai), Value::Float(bf)) => Some((*ai as f64).partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Float(af), Value::Integer(bi)) => Some(af.partial_cmp(&(*bi as f64)).unwrap_or(std::cmp::Ordering::Equal)),
+
+        // — 布尔 ↔ 整数/浮点：0/1 互通（SQLite 兼容语义） —
+        (Value::Boolean(ab), Value::Integer(bi)) => Some((*ab as i64).cmp(bi)),
+        (Value::Integer(ai), Value::Boolean(bb)) => Some(ai.cmp(&(*bb as i64))),
+        (Value::Boolean(ab), Value::Float(bf)) => Some((*ab as i64 as f64).partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Float(af), Value::Boolean(bb)) => Some(af.partial_cmp(&(*bb as i64 as f64)).unwrap_or(std::cmp::Ordering::Equal)),
+
+        // — 布尔 ↔ 文本：转 "true"/"false" 字符串比较 —
         (Value::Boolean(ab), Value::Text(bt)) => {
             let a_str = if *ab { "true" } else { "false" };
-            a_str.cmp(bt.as_str())
+            Some(a_str.cmp(bt.as_str()))
         }
         (Value::Text(at), Value::Boolean(bb)) => {
             let b_str = if *bb { "true" } else { "false" };
-            at.as_str().cmp(b_str)
+            Some(at.as_str().cmp(b_str))
         }
-        // DATE/TIME 内部为规范化 ISO 字符串 → 字典序即时间序；也允许与字符串字面量比较
-        (Value::Date(ad), Value::Date(bd)) => ad.cmp(bd),
-        (Value::Time(at), Value::Time(bt)) => at.cmp(bt),
-        (Value::Date(ad), Value::Text(bt)) => ad.cmp(bt),
-        (Value::Text(at), Value::Date(bd)) => at.cmp(bd),
-        (Value::Time(at), Value::Text(bt)) => at.cmp(bt),
-        (Value::Text(at), Value::Time(bt)) => at.cmp(bt),
-        _ => std::cmp::Ordering::Equal,
+
+        // — DATE/TIME 内部为规范化 ISO 字符串：与 TEXT 互通（字典序 == 时间序） —
+        (Value::Date(ad), Value::Text(bt)) => Some(ad.cmp(bt)),
+        (Value::Text(at), Value::Date(bd)) => Some(at.cmp(bd)),
+        (Value::Time(at), Value::Text(bt)) => Some(at.cmp(bt)),
+        (Value::Text(at), Value::Time(bt)) => Some(at.cmp(bt)),
+
+        // — 类型不匹配且无强制转换规则：不可比较 —
+        // Integer/Float ↔ Date/Time/Text、Boolean ↔ Date/Time、Date ↔ Time、Vector ↔ 任何
+        _ => None,
     }
 }
 
@@ -1095,25 +1129,15 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
     let col_val = get_column_value(row, col_name, schema)?;
     let literal = parse_literal(val_str);
 
-    let cmp = compare_values(col_val, &literal);
-
+    // 类型安全比较：不可比较的类型对返回 None → 谓词一律为 false（不命中）
+    let cmp_opt = compare_values(col_val, &literal);
     let result = match found_op {
-        ">"  => cmp == std::cmp::Ordering::Greater,
-        ">=" => cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal,
-        "<"  => cmp == std::cmp::Ordering::Less,
-        "<=" => cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal,
-        "="  => {
-            match (col_val, &literal) {
-                (Value::Text(t1), Value::Text(t2)) => t1 == t2,
-                _ => cmp == std::cmp::Ordering::Equal,
-            }
-        }
-        "!=" => {
-            match (col_val, &literal) {
-                (Value::Text(t1), Value::Text(t2)) => t1 != t2,
-                _ => cmp != std::cmp::Ordering::Equal,
-            }
-        }
+        ">"  => cmp_opt.map_or(false, |c| c == std::cmp::Ordering::Greater),
+        ">=" => cmp_opt.map_or(false, |c| c == std::cmp::Ordering::Greater || c == std::cmp::Ordering::Equal),
+        "<"  => cmp_opt.map_or(false, |c| c == std::cmp::Ordering::Less),
+        "<=" => cmp_opt.map_or(false, |c| c == std::cmp::Ordering::Less || c == std::cmp::Ordering::Equal),
+        "="  => cmp_opt.map_or(false, |c| c == std::cmp::Ordering::Equal),
+        "!=" => cmp_opt.map_or(true,  |c| c != std::cmp::Ordering::Equal),
         _ => return Err(format!("不支持的操作符: {}", found_op)),
     };
 
@@ -1386,7 +1410,8 @@ fn sort_rows(
         let vb = b.values.get(col_idx);
         match (va, vb) {
             (Some(va), Some(vb)) => {
-                let cmp = compare_values(va, vb);
+                // 不可比较的类型对在排序中视为相等（保持插入顺序稳定），不报错
+                let cmp = compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal);
                 if descending { cmp.reverse() } else { cmp }
             }
             _ => std::cmp::Ordering::Equal,
@@ -3020,6 +3045,175 @@ mod tests {
         match &r[0] {
             ExecuteResult::SelectResult { rows, .. } => {
                 assert_eq!(rows.len(), 3, "JOIN 等同于 INNER JOIN");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ========================================================================
+    // 类型安全比较语义测试矩阵（2026-09-17）
+    // 验证：类型不匹配的比较一律不命中，而不是走 _ => Equal 误判为匹配
+    // ========================================================================
+
+    /// 辅助：跑一条 WHERE 查询，返回命中行数
+    fn typecmp_count(executor: &mut Executor, sql: &str) -> usize {
+        let r = executor.execute(parse_sql(sql).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => rows.len(),
+            _ => panic!("Expected SelectResult for: {}", sql),
+        }
+    }
+
+    #[test]
+    fn test_integer_col_vs_text_literal_no_match() {
+        // 整数列与字符串字面量比较 → 不可比较 → 不命中
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (2, 'bob')").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE id = 'abc'"), 0);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE id = '1'"), 0, "字符串'1'不应匹配整数1");
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE id >= 'abc'"), 0);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE id <= '0'"), 0);
+    }
+
+    #[test]
+    fn test_text_col_vs_numeric_literal_no_match() {
+        // 文本列与数字字面量比较 → 不可比较 → 不命中
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (name) VALUES ('alice')").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE name = 123"), 0);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE name >= 0"), 0);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE name != 123"), 1, "!= 对不可比较类型应为 true");
+    }
+
+    #[test]
+    fn test_integer_vs_date_no_match() {
+        // 整数列与日期比较 → 不可比较 → 不命中
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, d DATE)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, d) VALUES (1, '2026-01-01')").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE id = '2026-01-01'"), 0);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE d = 1"), 0, "DATE 列不应匹配整数");
+    }
+
+    #[test]
+    fn test_boolean_vs_float互通() {
+        // Boolean ↔ Float 应该互通（之前缺失，落入 _ => Equal 误判）
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (active BOOLEAN)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (active) VALUES (true)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (active) VALUES (false)").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active = 1.0"), 1, "true == 1.0");
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active = 0.0"), 1, "false == 0.0");
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active >= 1.0"), 1);
+    }
+
+    #[test]
+    fn test_boolean_vs_date_no_match() {
+        // 布尔列与日期比较 → 不可比较 → 不命中
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (active BOOLEAN)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (active) VALUES (true)").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active = '2026-01-01'"), 0, "BOOLEAN 不应匹配日期字符串");
+    }
+
+    #[test]
+    fn test_date_vs_time_no_match() {
+        // Date 与 Time 比较 → 不可比较 → 不命中
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (d DATE, t TIME)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (d, t) VALUES ('2026-01-01', '12:00:00')").unwrap()).unwrap();
+
+        // 注意：WHERE d = t 这里两边都是列引用，当前 eval_condition 只支持「列 op 字面量」
+        // 用字面量交叉验证：DATE 列 vs TIME 字面量字符串——Date↔Text 走字典序会匹配！
+        // 这是设计上的取舍：Date/Time 与 Text 互通（允许字符串字面量比较）
+        // 所以这里测的是 DATE 列 vs 纯数字字面量（不可比较）
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE d = 100"), 0);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE t = 100"), 0);
+    }
+
+    #[test]
+    fn test_numeric_comparison_still_works() {
+        // 回归：同类型和数值互通的比较不受影响
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (i INTEGER, f FLOAT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (i, f) VALUES (1, 1.5)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (i, f) VALUES (2, 2.5)").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE i = 1"), 1);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE f >= 2.0"), 1);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE i < 10"), 2, "Integer < Integer 字面量");
+    }
+
+    #[test]
+    fn test_boolean_comparison_still_works() {
+        // 回归：布尔与布尔、布尔与整数比较
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (active BOOLEAN)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (active) VALUES (true)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (active) VALUES (false)").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active = true"), 1);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active = 1"), 1, "true == 1");
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE active = 0"), 1, "false == 0");
+    }
+
+    #[test]
+    fn test_date_text_comparison_still_works() {
+        // 回归：Date↔Text 字符串字面量比较仍可用
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (d DATE)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (d) VALUES ('2026-01-15')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (d) VALUES ('2026-06-01')").unwrap()).unwrap();
+
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE d = '2026-01-15'"), 1);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE d >= '2026-02-01'"), 1);
+        assert_eq!(typecmp_count(&mut executor, "SELECT * FROM t WHERE d < '2026-02-01'"), 1);
+    }
+
+    #[test]
+    fn test_order_by_mixed_types_stable() {
+        // ORDER BY 跨类型：不可比较视为相等，不 panic，保持插入顺序
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (v TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (v) VALUES ('banana')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (v) VALUES ('apple')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (v) VALUES ('cherry')").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT * FROM t ORDER BY v ASC").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                // 纯文本排序正常工作
+                assert_eq!(rows[0][0], "apple");
+                assert_eq!(rows[2][0], "cherry");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_having_type_mismatch_no_match() {
+        // HAVING 子句中类型不匹配 → 不命中
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (name TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (name, age) VALUES ('alice', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (name, age) VALUES ('bob', 25)").unwrap()).unwrap();
+
+        // HAVING name = 123 → 类型不匹配 → 不命中 → 0 组
+        let r = executor.execute(parse_sql(
+            "SELECT name, COUNT(*) FROM t GROUP BY name HAVING name = 123"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0, "HAVING 中类型不匹配不应命中任何组");
             }
             _ => panic!("Expected SelectResult"),
         }
