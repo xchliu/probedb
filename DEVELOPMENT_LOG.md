@@ -4,6 +4,51 @@
 
 ---
 
+## 2026-09-17（周计划周四任务：类型安全比较语义）
+
+### 完成
+- **消除 `_ => Equal` 静默误匹配** ⚠️（数据库最高优先级缺陷）
+  - 根因：`compare_values()` 的 `_ => std::cmp::Ordering::Equal` 兜底分支
+    使得**不可比较的类型对**（如 `Integer` ↔ `Text`、`Integer` ↔ `Date`、
+    `Boolean` ↔ `Date`）返回 `Equal`，导致 `=` 误判为匹配、`>=`/`<=` 误判为命中
+  - 后果举例：`WHERE id = 'abc'`（id 为 INTEGER）返回**所有行**而非 0 行——静默错误答案
+  - 修复：`compare_values()` 返回类型从 `Ordering` 改为 `Option<Ordering>`，
+    `None` 表示「不可比较」；类型不匹配且无强制转换规则的对落入 `None`
+  - 三处调用点适配：
+    - **WHERE 谓词**：`None` → `=`/`>`/`<`/`>=`/`<=` 为 false（不命中），`!=` 为 true
+    - **HAVING 分组过滤**：同 WHERE 语义
+    - **ORDER BY 排序**：`None` → `Equal`（保持插入顺序稳定，不 panic）
+
+- **补齐 Boolean ↔ Float 互通臂**
+  - 原先 `Boolean` ↔ `Integer` 有 arm（0/1 互通），但 `Boolean` ↔ `Float` 缺失，
+    落入 `_` 误判。新增 `active = 1.0` 正确匹配 `true`
+
+- **类型比较规则表定稿**（落成文档注释，附在 `compare_values` 上方）
+  - 可比较：同类型 + Integer↔Float + Boolean↔Integer/Float/Text + Date/Time↔Text
+  - 不可比较（None）：Integer/Float↔Date/Time/Text、Boolean↔Date/Time、Date↔Time、Vector↔任何
+
+### 设计决策
+- **不可比较 = 不命中**（而非报错）：数据库查询中类型不匹配的 WHERE 谓词
+  返回 false（行不匹配）比抛错更合理——大量行的类型不匹配是数据问题不是语法问题
+- **!= 对不可比较类型为 true**：因为「不等于」在类型层面不匹配时，语义上确实「不相等」
+- **ORDER BY 不报错**：排序是渲染层操作，跨类型排序视为相等保持稳定序，
+  避免因个别脏数据导致整列无法排序
+- **Date/Time ↔ Text 保持互通**：因为内部存 ISO 字符串，
+  允许 `WHERE d = '2026-01-01'` 字符串字面量比较（这是 DB 常见用法）
+
+### 测试
+- 173 passed, 0 failed（162 → 173，+11 全绿）
+- 新增跨类型比较矩阵：Integer↔Text/Date 不匹配、Text↔数值 不匹配、
+  Boolean↔Float 互通、Boolean↔Date 不匹配、Date/Time↔数值 不匹配、
+  HAVING 类型不匹配、ORDER BY 稳定、同类型/数值互通/布尔/日期回归
+
+### 文档更新
+- [x] 开发日志更新
+- [x] 周计划更新
+- [ ] 项目目标文档更新（无需变更）
+
+---
+
 ## 2026-09-16（晚间补记：INNER JOIN + 列名解析bug修复）
 
 ### 完成
