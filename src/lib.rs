@@ -733,4 +733,266 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}.wal", p));
         }
     }
+
+    // ========================================================================
+    // 边界用例补齐（2026-09-18 周五测试加固）
+    // ========================================================================
+
+    #[test]
+    fn test_extreme_date_boundaries() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, d DATE)").is_ok());
+
+        // 极值日期：0001-01-01（下界）和 9999-12-31（上界）
+        assert!(db.execute("INSERT INTO t (id, d) VALUES (1, '0001-01-01')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, d) VALUES (2, '9999-12-31')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, d) VALUES (3, '2025-06-15')").is_ok());
+
+        // 范围查询
+        let r = db.execute("SELECT id FROM t WHERE d >= '0001-01-01'").unwrap();
+        assert!(r.contains("3 行"), "所有日期 >= 0001-01-01");
+
+        let r = db.execute("SELECT id FROM t WHERE d <= '9999-12-31'").unwrap();
+        assert!(r.contains("3 行"), "所有日期 <= 9999-12-31");
+
+        // 极值排序
+        let r = db.execute("SELECT d FROM t ORDER BY d ASC").unwrap();
+        assert!(r.contains("0001-01-01"));
+        assert!(r.contains("9999-12-31"));
+
+        // 精确匹配极值
+        let r = db.execute("SELECT id FROM t WHERE d = '0001-01-01'").unwrap();
+        assert!(r.contains("1 行"));
+    }
+
+    #[test]
+    fn test_extreme_time_boundaries() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, at TIME)").is_ok());
+
+        // 极值时间：00:00:00（下界）和 23:59:59（上界）
+        assert!(db.execute("INSERT INTO t (id, at) VALUES (1, '00:00:00')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, at) VALUES (2, '23:59:59')").is_ok());
+        assert!(db.execute("INSERT INTO t (id, at) VALUES (3, '12:30:00')").is_ok());
+
+        // 范围查询
+        let r = db.execute("SELECT id FROM t WHERE at >= '00:00:00'").unwrap();
+        assert!(r.contains("3 行"));
+
+        let r = db.execute("SELECT id FROM t WHERE at < '23:59:59'").unwrap();
+        assert!(r.contains("2 行"), "12:30 和 00:00 < 23:59:59");
+    }
+
+    #[test]
+    fn test_large_integer_values() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, val INTEGER)").is_ok());
+
+        // i64 极值
+        assert!(db.execute("INSERT INTO t (id, val) VALUES (1, 9223372036854775807)").is_ok(), "i64::MAX");
+        assert!(db.execute("INSERT INTO t (id, val) VALUES (2, -9223372036854775808)").is_ok(), "i64::MIN");
+        assert!(db.execute("INSERT INTO t (id, val) VALUES (3, 0)").is_ok());
+
+        let r = db.execute("SELECT val FROM t ORDER BY val ASC").unwrap();
+        assert!(r.contains("-9223372036854775808"));
+        assert!(r.contains("9223372036854775807"));
+
+        // WHERE 精确匹配极值
+        let r = db.execute("SELECT id FROM t WHERE val = 9223372036854775807").unwrap();
+        assert!(r.contains("1 行"));
+    }
+
+    #[test]
+    fn test_special_characters_in_text() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER, note TEXT)").is_ok());
+
+        // 含管道符（持久化编码转义字符）
+        assert!(db.execute("INSERT INTO t (id, note) VALUES (1, 'a|b|c')").is_ok());
+        // 含反斜杠
+        assert!(db.execute("INSERT INTO t (id, note) VALUES (2, 'path/to/file')").is_ok());
+        // 含换行符（通过 SQL 注入不会，但值本身可能含特殊字符）
+        assert!(db.execute("INSERT INTO t (id, note) VALUES (3, 'hello world')").is_ok());
+        // 中文
+        assert!(db.execute("INSERT INTO t (id, note) VALUES (4, '你好世界')").is_ok());
+
+        let r = db.execute("SELECT id, note FROM t ORDER BY id ASC").unwrap();
+        assert!(r.contains("a|b|c"), "管道符应正确存储");
+        assert!(r.contains("你好世界"), "中文应正确存储");
+
+        // 持久化往返：含特殊字符的文本落盘再加载仍正确
+        let path = temp_db_path("probedb_special_chars_test.pdb");
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+        {
+            let mut db2 = ProbeDB::open(&path).unwrap();
+            db2.execute("CREATE TABLE t2 (id INTEGER, note TEXT)").unwrap();
+            db2.execute("INSERT INTO t2 (id, note) VALUES (1, 'x|y\\z')").unwrap();
+            db2.execute("INSERT INTO t2 (id, note) VALUES (2, 'a|b|c|d')").unwrap();
+            db2.persist().unwrap();
+        }
+        {
+            let mut db3 = ProbeDB::open(&path).unwrap();
+            let r = db3.execute("SELECT note FROM t2 WHERE id = 1").unwrap();
+            assert!(r.contains("x|y\\z"), "特殊字符持久化往返应无损: {}", r);
+            let r2 = db3.execute("SELECT note FROM t2 WHERE id = 2").unwrap();
+            assert!(r2.contains("a|b|c|d"), "多管道符持久化往返应无损: {}", r2);
+        }
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+    }
+
+    #[test]
+    fn test_batch_mixed_types_insert() {
+        let mut db = ProbeDB::new();
+        assert!(db.execute(
+            "CREATE TABLE records (id INTEGER, name TEXT, score FLOAT, active BOOLEAN, created DATE, ts TIME, emb VECTOR(2))"
+        ).is_ok());
+
+        // 批量插入混合类型
+        assert!(db.execute(
+            "INSERT INTO records (id, name, score, active, created, ts, emb) VALUES \
+             (1, 'alpha', 95.5, true, '2026-01-15', '09:00:00', '[1.0,0.0]'), \
+             (2, 'beta', 72.3, false, '2025-12-31', '14:30:00', '[0.0,1.0]'), \
+             (3, 'gamma', 88.9, true, '2026-06-01', '18:45:00', '[0.5,0.5]')"
+        ).is_ok());
+
+        // 验证所有类型正确存储和查询
+        let r = db.execute("SELECT id, name, score, active, created, ts FROM records WHERE active = true ORDER BY score DESC").unwrap();
+        assert!(r.contains("2 行"), "active=true 应有2行");
+        assert!(r.contains("alpha"), "score 降序，alpha 应在前");
+        assert!(r.contains("95.5"));
+
+        // 日期范围过滤 + 布尔过滤组合
+        let r = db.execute("SELECT id FROM records WHERE created >= '2026-01-01' AND active = true").unwrap();
+        assert!(r.contains("2 行"), "2026年后且active=true: id=1和3");
+    }
+
+    #[test]
+    fn test_limit_zero() {
+        // LIMIT 0 返回空结果（边界用例）
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER)").is_ok());
+        assert!(db.execute("INSERT INTO t (id) VALUES (1)").is_ok());
+        assert!(db.execute("INSERT INTO t (id) VALUES (2)").is_ok());
+
+        let r = db.execute("SELECT id FROM t LIMIT 0").unwrap();
+        assert!(r.contains("0 行"), "LIMIT 0 应返回0行");
+    }
+
+    #[test]
+    fn test_offset_zero() {
+        // OFFSET 0 等于无偏移
+        let mut db = ProbeDB::new();
+        assert!(db.execute("CREATE TABLE t (id INTEGER)").is_ok());
+        assert!(db.execute("INSERT INTO t (id) VALUES (1)").is_ok());
+        assert!(db.execute("INSERT INTO t (id) VALUES (2)").is_ok());
+
+        let r = db.execute("SELECT id FROM t ORDER BY id ASC OFFSET 0").unwrap();
+        assert!(r.contains("2 行"), "OFFSET 0 应返回全部");
+    }
+
+    // ========================================================================
+    // 本周功能集成测试（2026-09-18 周五测试加固）
+    // ========================================================================
+
+    #[test]
+    fn test_week_integration_full_pipeline() {
+        // 本周全部能力的综合验证：
+        // GROUP BY + HAVING + 新类型(BOOLEAN/DATE/TIME) + 类型安全比较 + 聚合函数
+        let mut db = ProbeDB::new();
+        assert!(db.execute(
+            "CREATE TABLE tasks (id INTEGER, dept TEXT, priority INTEGER, due DATE, done BOOLEAN, est TIME)"
+        ).is_ok());
+
+        assert!(db.execute(
+            "INSERT INTO tasks (id, dept, priority, due, done, est) VALUES \
+             (1, 'eng', 5, '2026-09-14', true, '02:00:00'), \
+             (2, 'eng', 3, '2026-09-15', false, '04:30:00'), \
+             (3, 'sales', 4, '2026-09-16', true, '01:00:00'), \
+             (4, 'eng', 2, '2026-09-17', false, '03:15:00'), \
+             (5, 'sales', 5, '2026-09-18', true, '08:00:00')"
+        ).is_ok());
+
+        // 1. GROUP BY dept + COUNT(*) + AVG(priority)
+        let r = db.execute("SELECT dept, COUNT(*), AVG(priority) FROM tasks GROUP BY dept ORDER BY dept ASC").unwrap();
+        assert!(r.contains("eng"));
+        assert!(r.contains("sales"));
+
+        // 2. GROUP BY + HAVING 过滤
+        let r = db.execute("SELECT dept, COUNT(*) FROM tasks GROUP BY dept HAVING COUNT(*) >= 3").unwrap();
+        assert!(r.contains("1 行"), "只有 eng 有3条记录");
+
+        // 3. WHERE + GROUP BY + HAVING + ORDER BY 综合查询
+        let r = db.execute(
+            "SELECT dept, COUNT(*), AVG(priority) FROM tasks WHERE due >= '2026-09-15' GROUP BY dept HAVING COUNT(*) >= 1 ORDER BY dept ASC"
+        ).unwrap();
+        // due >= '2026-09-15': task2(eng), task3(sales), task4(eng), task5(sales)
+        // eng: 2 tasks, sales: 2 tasks
+        assert!(r.contains("2 行"), "两组各2条");
+
+        // 4. 布尔列 GROUP BY + 类型安全
+        let r = db.execute("SELECT done, COUNT(*) FROM tasks GROUP BY done ORDER BY done ASC").unwrap();
+        assert!(r.contains("2 行"), "done 分 true/false 两组");
+
+        // 5. 时间范围过滤 + 聚合
+        // est: 02:00, 04:30, 01:00, 03:15, 08:00 → >= 03:00 的有3条
+        let r = db.execute("SELECT COUNT(*) FROM tasks WHERE est >= '03:00:00'").unwrap();
+        assert!(r.contains("3"), "est >= 03:00 的有3条");
+
+        // 6. 类型不匹配不误匹配（回归保护）
+        let r = db.execute("SELECT id FROM tasks WHERE priority = 'high'").unwrap();
+        assert!(r.contains("0 行"), "整数列不应匹配字符串字面量");
+    }
+
+    #[test]
+    fn test_persist_all_types_roundtrip() {
+        // 所有 7 种数据类型持久化往返测试
+        let path = temp_db_path("probedb_all_types_persist_test.pdb");
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            assert!(db.execute(
+                "CREATE TABLE all_types (id INTEGER, name TEXT, score FLOAT, active BOOLEAN, created DATE, ts TIME, emb VECTOR(3))"
+            ).is_ok());
+            assert!(db.execute(
+                "INSERT INTO all_types (id, name, score, active, created, ts, emb) VALUES \
+                 (1, 'test', 42.5, true, '2026-09-18', '14:01:30', '[0.1,0.2,0.3]')"
+            ).is_ok());
+            db.persist().unwrap();
+        }
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            let r = db.execute("SELECT * FROM all_types").unwrap();
+            assert!(r.contains("1"), "id=1");
+            assert!(r.contains("test"));
+            assert!(r.contains("42.5"));
+            assert!(r.contains("true"), "active=true");
+            assert!(r.contains("2026-09-18"));
+            assert!(r.contains("14:01:30"));
+            assert!(r.contains("0.1") && r.contains("0.3"), "向量值");
+
+            // 向量查询在持久化恢复后仍可用
+            let r2 = db.execute("SELECT id FROM all_types WHERE vector_similarity(emb, '[0.1,0.2,0.3]') > 0.9").unwrap();
+            assert!(r2.contains("1 行"), "向量精确匹配应命中");
+        }
+
+        for p in [&path] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+        }
+    }
 }

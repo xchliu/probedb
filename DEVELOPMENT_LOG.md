@@ -4,7 +4,37 @@
 
 ---
 
-## 2026-09-17（周计划周四任务：类型安全比较语义）
+## 2026-09-18（周计划周五任务：本周回顾 + 测试加固 + 文档收口）
+
+### 完成
+- **边界用例补齐**（9个新测试）
+  - 极值日期：0001-01-01（下界）、9999-12-31（上界）——范围过滤、排序、精确匹配
+  - 极值时间：00:00:00（下界）、23:59:59（上界）——范围过滤
+  - i64 极值：9223372036854775807（MAX）、-9223372036854775808（MIN）——排序、精确匹配
+  - 特殊字符文本：管道符 `|`、反斜杠 `\`、中文——存储查询 + 持久化往返无损
+  - 批量混合类型 INSERT：7种类型综合插入 + WHERE+ORDER BY 验证
+  - LIMIT 0 / OFFSET 0 边界
+  - 本周功能集成测试：GROUP BY + HAVING + BOOLEAN/DATE/TIME + 类型安全比较 + 聚合函数
+  - 全类型持久化往返：7种类型落盘→恢复→向量查询全链路
+
+- **项目目标文档同步**
+  - MVP 清单从 9 项扩展到 18 项，全部标注状态（16项✅，1项⏳）
+  - 验证标准 Phase 1：12项✅通过，3项⏳待验证（启动时间/内存占用/Hermes接入）
+  - 原"第一版不支持"列表中 JOIN/GROUP BY/持久化 三个已超额完成，移至"✅第一版支持"
+
+### 测试
+- 182 passed, 0 failed（173 → 182，+9 全绿）
+- 新增测试：test_extreme_date_boundaries, test_extreme_time_boundaries,
+  test_large_integer_values, test_special_characters_in_text,
+  test_batch_mixed_types_insert, test_limit_zero, test_offset_zero,
+  test_week_integration_full_pipeline, test_persist_all_types_roundtrip
+
+### 文档更新
+- [x] 开发日志更新
+- [x] 周计划更新
+- [x] 项目目标文档更新（MVP清单+验证标准同步）
+
+---
 
 ### 完成
 - **消除 `_ => Equal` 静默误匹配** ⚠️（数据库最高优先级缺陷）
