@@ -366,11 +366,11 @@ impl Executor {
 
                 // ORDER BY
                 let mut sorted: Vec<Row> = if let Some(ref order_by_str) = order_by {
-                    let (order_col, descending) = parse_order_by_str(order_by_str);
-
-                    // 检查是否是 vector_similarity 排序
+                    // 检查是否是 vector_similarity 排序（单列函数调用）
                     if let Some(ref _vs) = vector_sim_order {
-                        // 用预先计算的相似度排序
+                        // vector_similarity 排序：用预先计算的相似度排序
+                        let (order_col, descending) = parse_order_by_str(order_by_str);
+                        let _ = order_col; // vector_sim_order 已有列信息
                         scored_rows.sort_by(|a, b| {
                             let sa = a.1.unwrap_or(0.0);
                             let sb = b.1.unwrap_or(0.0);
@@ -379,7 +379,9 @@ impl Executor {
                         });
                         scored_rows.iter().map(|(r, _)| r.clone()).collect()
                     } else {
-                        sort_rows(&matched, &order_col, descending, &schema)?
+                        // 普通列排序：支持多列
+                        let keys = parse_order_by_keys(order_by_str);
+                        sort_rows_multi(&matched, &keys, &schema)?
                     }
                 } else {
                     matched
@@ -947,16 +949,50 @@ fn parse_order_by_vector_call(order_by: Option<&str>) -> Option<VectorSimilarity
     parse_vector_similarity_call(func_text)
 }
 
-/// 解析 ORDER BY 字符串为 (列名, 是否降序)
+/// 排序键：列名 + 方向
+struct OrderKey {
+    column: String,
+    descending: bool,
+}
+
+/// 解析 ORDER BY 字符串为排序键列表（支持多列）
+/// "col1 DESC, col2 ASC" → [OrderKey{col1, true}, OrderKey{col2, false}]
+/// "col1" → [OrderKey{col1, false}]
+/// 括号/方括号感知分割，避免 vector_similarity(emb, '[0.1,0.2]') 内的逗号误分割
+fn parse_order_by_keys(order_by: &str) -> Vec<OrderKey> {
+    let parts = split_top_level(order_by, ",");
+    let mut keys = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+        let upper = part.to_uppercase();
+        if let Some(pos) = upper.rfind(" DESC") {
+            keys.push(OrderKey {
+                column: part[..pos].trim().to_string(),
+                descending: true,
+            });
+        } else if let Some(pos) = upper.rfind(" ASC") {
+            keys.push(OrderKey {
+                column: part[..pos].trim().to_string(),
+                descending: false,
+            });
+        } else {
+            keys.push(OrderKey {
+                column: part.to_string(),
+                descending: false,
+            });
+        }
+    }
+    keys
+}
+
+/// 兼容旧调用：解析单列 ORDER BY 字符串为 (列名, 是否降序)
 fn parse_order_by_str(order_by: &str) -> (String, bool) {
-    let order_by = order_by.trim();
-    let upper = order_by.to_uppercase();
-    if let Some(pos) = upper.rfind(" DESC") {
-        (order_by[..pos].trim().to_string(), true)
-    } else if let Some(pos) = upper.rfind(" ASC") {
-        (order_by[..pos].trim().to_string(), false)
+    let keys = parse_order_by_keys(order_by);
+    if let Some(k) = keys.into_iter().next() {
+        (k.column, k.descending)
     } else {
-        (order_by.to_string(), false)
+        (order_by.trim().to_string(), false)
     }
 }
 
@@ -1358,10 +1394,11 @@ fn filter_rows(rows: &[Row], where_clause: &str, schema: &TableSchema) -> Result
     Ok(all_matched)
 }
 
-/// 在顶层（不在括号内）分割
+/// 在顶层（不在括号/方括号内）分割
 fn split_top_level<'a>(s: &'a str, delimiter: &str) -> Vec<&'a str> {
     let mut parts = Vec::new();
     let mut depth = 0;
+    let mut bracket_depth = 0;
     let mut start = 0;
     let mut i = 0;
     let bytes = s.as_bytes();
@@ -1370,7 +1407,9 @@ fn split_top_level<'a>(s: &'a str, delimiter: &str) -> Vec<&'a str> {
     while i < s.len() {
         if bytes[i] == b'(' { depth += 1; }
         else if bytes[i] == b')' && depth > 0 { depth -= 1; }
-        else if depth == 0 && i + delim_bytes.len() <= s.len() {
+        else if bytes[i] == b'[' { bracket_depth += 1; }
+        else if bytes[i] == b']' && bracket_depth > 0 { bracket_depth -= 1; }
+        else if depth == 0 && bracket_depth == 0 && i + delim_bytes.len() <= s.len() {
             if &bytes[i..i + delim_bytes.len()] == delim_bytes {
                 parts.push(&s[start..i]);
                 i += delim_bytes.len();
@@ -1396,26 +1435,49 @@ fn sort_rows(
     descending: bool,
     schema: &TableSchema,
 ) -> Result<Vec<Row>, String> {
+    sort_rows_multi(rows, &[OrderKey { column: order_col.to_string(), descending }], schema)
+}
+
+/// 多键排序：按排序键列表依次比较（字典序）
+/// 第一键相同时用第二键，以此类推
+fn sort_rows_multi(
+    rows: &[Row],
+    keys: &[OrderKey],
+    schema: &TableSchema,
+) -> Result<Vec<Row>, String> {
+    if keys.is_empty() {
+        return Ok(rows.to_vec());
+    }
+
+    // 预解析每个键的列索引
+    let mut key_indices: Vec<(usize, bool)> = Vec::new();
+    for key in keys {
+        let bare = key.column.rsplit('.').next().unwrap_or(&key.column);
+        let ci = schema.columns.iter()
+            .find(|c| c.name == key.column || c.name == bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
+            .ok_or_else(|| format!("排序列 '{}' 不存在", key.column))?;
+        key_indices.push((ci.index, key.descending));
+    }
+
     let mut sorted = rows.to_vec();
-
-    // 获取列索引（支持限定列名 table.col 和裸列名 col）
-    let bare = order_col.rsplit('.').next().unwrap_or(order_col);
-    let ci = schema.columns.iter()
-        .find(|c| c.name == *order_col || c.name == *bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
-        .ok_or_else(|| format!("排序列 '{}' 不存在", order_col))?;
-    let col_idx = ci.index;
-
     sorted.sort_by(|a, b| {
-        let va = a.values.get(col_idx);
-        let vb = b.values.get(col_idx);
-        match (va, vb) {
-            (Some(va), Some(vb)) => {
-                // 不可比较的类型对在排序中视为相等（保持插入顺序稳定），不报错
-                let cmp = compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal);
-                if descending { cmp.reverse() } else { cmp }
+        for &(col_idx, descending) in &key_indices {
+            let va = a.values.get(col_idx);
+            let vb = b.values.get(col_idx);
+            let cmp = match (va, vb) {
+                (Some(va), Some(vb)) => {
+                    // 不可比较的类型对在排序中视为相等（保持插入顺序稳定），不报错
+                    compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                _ => std::cmp::Ordering::Equal,
+            };
+            let cmp = if descending { cmp.reverse() } else { cmp };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
             }
-            _ => std::cmp::Ordering::Equal,
         }
+        // 所有键都相等，保持原顺序（稳定排序）
+        std::cmp::Ordering::Equal
     });
 
     Ok(sorted)
@@ -3217,5 +3279,267 @@ mod tests {
             }
             _ => panic!("Expected SelectResult"),
         }
+    }
+
+    // ===== 多列 ORDER BY 测试 =====
+
+    #[test]
+    fn test_multi_column_order_by_two_keys_desc_asc() {
+        // ORDER BY col1 DESC, col2 ASC — 第一键降序，第二键升序
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE tasks (id INTEGER, priority INTEGER, created TEXT)"
+        ).unwrap()).unwrap();
+        // 三行 priority=2，验证第二键 created ASC 生效
+        executor.execute(parse_sql("INSERT INTO tasks (id, priority, created) VALUES (1, 2, '2026-03-01')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO tasks (id, priority, created) VALUES (2, 2, '2026-01-01')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO tasks (id, priority, created) VALUES (3, 2, '2026-02-01')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO tasks (id, priority, created) VALUES (4, 1, '2026-01-01')").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id, priority, created FROM tasks ORDER BY priority DESC, created ASC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // priority=2 组（3行），created ASC → 01-01, 02-01, 03-01
+                // priority=1 组（1行）
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0][0], "2", "priority=2, created=01-01 → id=2");
+                assert_eq!(rows[1][0], "3", "priority=2, created=02-01 → id=3");
+                assert_eq!(rows[2][0], "1", "priority=2, created=03-01 → id=1");
+                assert_eq!(rows[3][0], "4", "priority=1 → id=4");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_three_keys() {
+        // ORDER BY a DESC, b ASC, c DESC — 三键排序
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE data (id INTEGER, a INTEGER, b INTEGER, c INTEGER)"
+        ).unwrap()).unwrap();
+        // a=1, b=1: c=3,1 → c DESC → 3, 1
+        executor.execute(parse_sql("INSERT INTO data (id, a, b, c) VALUES (1, 1, 1, 3)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO data (id, a, b, c) VALUES (2, 1, 1, 1)").unwrap()).unwrap();
+        // a=1, b=2: c=5
+        executor.execute(parse_sql("INSERT INTO data (id, a, b, c) VALUES (3, 1, 2, 5)").unwrap()).unwrap();
+        // a=2, b=1: c=0
+        executor.execute(parse_sql("INSERT INTO data (id, a, b, c) VALUES (4, 2, 1, 0)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM data ORDER BY a DESC, b ASC, c DESC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // a DESC: a=2 first (id=4), then a=1
+                // a=1: b ASC → b=1 first (id=1,2), then b=2 (id=3)
+                // a=1,b=1: c DESC → c=3 (id=1), c=1 (id=2)
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0][0], "4", "a=2 DESC → id=4");
+                assert_eq!(rows[1][0], "1", "a=1, b=1, c=3 DESC → id=1");
+                assert_eq!(rows[2][0], "2", "a=1, b=1, c=1 → id=2");
+                assert_eq!(rows[3][0], "3", "a=1, b=2 → id=3");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_all_ascending() {
+        // ORDER BY a ASC, b ASC — 全升序
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, a, b) VALUES (1, 1, 2)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, a, b) VALUES (2, 1, 1)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, a, b) VALUES (3, 2, 1)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM t ORDER BY a ASC, b ASC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // a=1: b ASC → 1(id=2), 2(id=1); a=2: id=3
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], "2");
+                assert_eq!(rows[1][0], "1");
+                assert_eq!(rows[2][0], "3");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_with_where() {
+        // WHERE + 多列 ORDER BY 联动
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE emp (id INTEGER, dept TEXT, level INTEGER, salary INTEGER)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, level, salary) VALUES (1, 'Eng', 3, 100)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, level, salary) VALUES (2, 'Eng', 2, 90)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, level, salary) VALUES (1, 'Eng', 2, 95)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, level, salary) VALUES (3, 'Eng', 2, 85)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO emp (id, dept, level, salary) VALUES (4, 'Sales', 1, 50)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id, level, salary FROM emp WHERE dept = 'Eng' ORDER BY level DESC, salary DESC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // Eng 部门：level DESC
+                // level=3: id=1, salary=100
+                // level=2: salary DESC → 95(id=1), 90(id=2), 85(id=3)
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0][0], "1", "level=3, salary=100");
+                assert_eq!(rows[1][0], "1", "level=2, salary=95");
+                assert_eq!(rows[2][0], "2", "level=2, salary=90");
+                assert_eq!(rows[3][0], "3", "level=2, salary=85");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_mixed_types() {
+        // 多列排序混合类型：INTEGER + TEXT + DATE
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE events (id INTEGER, category TEXT, event_date DATE)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO events (id, category, event_date) VALUES (1, 'B', '2026-01-01')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO events (id, category, event_date) VALUES (2, 'A', '2026-03-01')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO events (id, category, event_date) VALUES (3, 'A', '2026-01-01')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO events (id, category, event_date) VALUES (4, 'A', '2026-02-01')").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM events ORDER BY category ASC, event_date ASC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // A: date ASC → 01-01(id=3), 02-01(id=4), 03-01(id=2)
+                // B: id=1
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0][0], "3");
+                assert_eq!(rows[1][0], "4");
+                assert_eq!(rows[2][0], "2");
+                assert_eq!(rows[3][0], "1");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_single_key_unchanged() {
+        // 单列 ORDER BY 行为不变（回归测试）
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, val INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, val) VALUES (1, 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, val) VALUES (2, 10)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, val) VALUES (3, 20)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM t ORDER BY val DESC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], "1", "val=30 → id=1");
+                assert_eq!(rows[1][0], "3", "val=20 → id=3");
+                assert_eq!(rows[2][0], "2", "val=10 → id=2");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_empty_table() {
+        // 空表 + 多列 ORDER BY → 0 行
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM t ORDER BY a DESC, b ASC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_with_limit() {
+        // 多列 ORDER BY + LIMIT 取前N
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER)").unwrap()).unwrap();
+        for i in 0..10 {
+            let a = i % 3;
+            let b = 9 - i;
+            executor.execute(parse_sql(&format!(
+                "INSERT INTO t (id, a, b) VALUES ({}, {}, {})", i, a, b
+            )).unwrap()).unwrap();
+        }
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM t ORDER BY a ASC, b DESC LIMIT 3"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                // a=0: b DESC → 9(id=0), 6(id=3), 3(id=6)
+                assert_eq!(rows[0][0], "0");
+                assert_eq!(rows[1][0], "3");
+                assert_eq!(rows[2][0], "6");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_second_key_date_time() {
+        // 第二键为 DATE/TIME 类型排序
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE logs (id INTEGER, level INTEGER, log_date DATE, log_time TIME)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO logs (id, level, log_date, log_time) VALUES (1, 1, '2026-01-01', '10:00:00')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO logs (id, level, log_date, log_time) VALUES (2, 1, '2026-01-01', '08:00:00')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO logs (id, level, log_date, log_time) VALUES (3, 1, '2026-01-01', '12:00:00')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO logs (id, level, log_date, log_time) VALUES (4, 2, '2026-01-01', '09:00:00')").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT id FROM logs ORDER BY level ASC, log_time ASC"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                // level=1: time ASC → 08(id=2), 10(id=1), 12(id=3)
+                // level=2: id=4
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0][0], "2");
+                assert_eq!(rows[1][0], "1");
+                assert_eq!(rows[2][0], "3");
+                assert_eq!(rows[3][0], "4");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_multi_column_order_by_nonexistent_column_errors() {
+        // 多列排序中第二列不存在 → 报错
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, a INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, a) VALUES (1, 1)").unwrap()).unwrap();
+
+        let result = executor.execute(parse_sql(
+            "SELECT id FROM t ORDER BY a ASC, ghost ASC"
+        ).unwrap());
+        assert!(result.is_err(), "不存在的排序列应报错");
+        let err = result.unwrap_err();
+        assert!(err.contains("排序列"), "错误信息应包含'排序列'，实际: {}", err);
+        assert!(err.contains("ghost"), "错误信息应包含列名，实际: {}", err);
     }
 }
