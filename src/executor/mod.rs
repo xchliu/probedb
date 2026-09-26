@@ -251,11 +251,10 @@ impl Executor {
                     scored_rows = filter_rows_with_scores(scored_rows, condition, &schema)?;
                 }
 
-                // 提取原始行（过滤后的）
-                let matched: Vec<Row> = scored_rows.iter().map(|(r, _)| r.clone()).collect();
-
                 // ===== GROUP BY 分组聚合 =====
+                // GROUP BY 需要纯行 Vec，仅在此分支提取（避免无 GROUP BY 时的冗余 clone）
                 if let Some(ref gb_str) = group_by {
+                    let matched: Vec<Row> = scored_rows.iter().map(|(r, _)| r.clone()).collect();
                     return execute_group_by(&matched, &columns, gb_str, having.as_deref(), &schema);
                 }
 
@@ -268,7 +267,7 @@ impl Executor {
 
                 // COUNT(*) 聚合
                 if upper_cols.len() == 1 && (upper_cols[0] == "COUNT(*)" || upper_cols[0] == "COUNT (*)") {
-                    let count = matched.len();
+                    let count = scored_rows.len();
                     return Ok(ExecuteResult::SelectResult {
                         columns: vec!["count".to_string()],
                         rows: vec![vec![count.to_string()]],
@@ -287,7 +286,7 @@ impl Executor {
                             .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
 
                         let mut nums: Vec<f64> = Vec::new();
-                        for row in &matched {
+                        for (row, _) in &scored_rows {
                             if let Some(v) = row.values.get(ci.index) {
                                 match v {
                                     Value::Integer(n) => nums.push(*n as f64),
@@ -364,8 +363,8 @@ impl Executor {
                     proj_names = names;
                 }
 
-                // ORDER BY
-                let mut sorted: Vec<Row> = if let Some(ref order_by_str) = order_by {
+                // ORDER BY（原地排序 scored_rows，避免额外 clone）
+                if let Some(ref order_by_str) = order_by {
                     // 检查是否是 vector_similarity 排序（单列函数调用）
                     if let Some(ref _vs) = vector_sim_order {
                         // vector_similarity 排序：用预先计算的相似度排序
@@ -377,18 +376,15 @@ impl Executor {
                             if descending { sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) }
                             else { sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal) }
                         });
-                        scored_rows.iter().map(|(r, _)| r.clone()).collect()
                     } else {
-                        // 普通列排序：支持多列
+                        // 普通列排序：支持多列，原地排序 scored_rows
                         let keys = parse_order_by_keys(order_by_str);
-                        sort_rows_multi(&matched, &keys, &schema)?
+                        sort_scored_rows_multi(&mut scored_rows, &keys, &schema)?;
                     }
-                } else {
-                    matched
-                };
+                }
 
-                // 转换行为字符串（仅投影列）
-                let mut result_rows: Vec<Vec<String>> = sorted.iter().map(|row| {
+                // 转换行为字符串（仅投影列，直接从 scored_rows 格式化，避免中间 Vec<Row>）
+                let mut result_rows: Vec<Vec<String>> = scored_rows.iter().map(|(row, _)| {
                     proj_indices.iter().map(|&i| {
                         if i < row.values.len() {
                             row.values[i].to_string()
@@ -1481,6 +1477,52 @@ fn sort_rows_multi(
     });
 
     Ok(sorted)
+}
+
+/// 带得分的行原地排序（避免 to_vec + 后续 clone 开销）
+///
+/// 与 sort_rows_multi 语义一致，但直接对 `Vec<(Row, Option<f64>)>` 原地排序，
+/// 省去一次 `to_vec()` clone。用于 SELECT 的 ORDER BY 路径。
+fn sort_scored_rows_multi(
+    rows: &mut [(Row, Option<f64>)],
+    keys: &[OrderKey],
+    schema: &TableSchema,
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    // 预解析每个键的列索引
+    let mut key_indices: Vec<(usize, bool)> = Vec::new();
+    for key in keys {
+        let bare = key.column.rsplit('.').next().unwrap_or(&key.column);
+        let ci = schema.columns.iter()
+            .find(|c| c.name == key.column || c.name == bare || c.name.ends_with(&format!(".{}", bare)) && c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
+            .ok_or_else(|| format!("排序列 '{}' 不存在", key.column))?;
+        key_indices.push((ci.index, key.descending));
+    }
+
+    rows.sort_by(|(a, _), (b, _)| {
+        for &(col_idx, descending) in &key_indices {
+            let va = a.values.get(col_idx);
+            let vb = b.values.get(col_idx);
+            let cmp = match (va, vb) {
+                (Some(va), Some(vb)) => {
+                    // 不可比较的类型对在排序中视为相等（保持插入顺序稳定），不报错
+                    compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                _ => std::cmp::Ordering::Equal,
+            };
+            let cmp = if descending { cmp.reverse() } else { cmp };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        // 所有键都相等，保持原顺序（稳定排序）
+        std::cmp::Ordering::Equal
+    });
+
+    Ok(())
 }
 
 // ===== 测试 =====
