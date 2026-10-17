@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-10-16（周五：第8周第5天 — Python 绑定完成，本周结束）
+
+### 完成
+- **Python ctypes binding**：在 `python/probedb.py` 实现 Pythonic 封装（仿 sqlite3 用法）
+  - `ProbeDB()` 内存模式 / `ProbeDB.open(path)` 持久化模式
+  - `execute(sql)` 返回 `QueryResult`（成功/错误统一处理）
+  - `persist()` / `close()` / `set_batch_mode()` 完整暴露
+  - 自动查找 `libprobedb.dylib`（支持 debug/release/build 目录）
+  - CRUD + 向量查询 + 持久化往返全链路验证通过
+- **决策**: 走方案A路线——先做独立 Python 工具给 Hermes 用，不等 Hermes 内部存储改造确认
+
+### 测试
+- **196 passed, 0 failed** ✅（Python 层 5 个测试：CRUD/向量/持久化/批量/错误处理）
+
+### 阻塞
+- Hermes 接入切入点确认 + C ABI 选型确认（9/1起 ⚠️，已46天）
+  - C ABI 已实现并验证，Python 绑定已就绪
+  - 下一步：待坦哥确认后，在 Hermes 中集成 Python 绑定替换记忆存储
+
 ## 2026-10-15（周四：第8周第4天 — 无新任务，阻塞第44天）
 
 ### 状态
