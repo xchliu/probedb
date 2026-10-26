@@ -28,7 +28,86 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
+
+def sql_literal(value: str) -> str:
+    """把字符串安全转成 SQL 字面量（SQL 标准 '' 转义）。"""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _param_literal(value: Any) -> str:
+    """把 Python 参数转成 SQL 字面量。
+
+    - None：ProbeDB 无 NULL 类型，明确报错（避免把 None 静默变成空串/0）
+    - bool / int / float：直接输出（bool → 1/0，与 SQLite 一致）
+    - str：'' 转义
+    """
+    if value is None:
+        raise ProbeDBError("ProbeDB 暂不支持 NULL 参数（无 NULL 类型）")
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (bytes, bytearray)):
+        raise ProbeDBError("ProbeDB 暂不支持 bytes 参数")
+    return sql_literal(str(value))
+
+
+def bind_params(sql: str, params: Optional[Sequence[Any]]) -> str:
+    """把 `?` 位置参数安全替换进 SQL（跳过单引号字符串、'' 转义与 -- 注释）。"""
+    if params is None:
+        return sql
+    params = list(params)
+    out: list[str] = []
+    used = 0
+    i = 0
+    n = len(sql)
+    in_quote = False
+    while i < n:
+        c = sql[i]
+        if in_quote:
+            out.append(c)
+            if c == "'":
+                if i + 1 < n and sql[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                in_quote = False
+            i += 1
+            continue
+        if c == "'":
+            in_quote = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            # -- 行注释原样保留（Rust 解析层会丢弃）
+            end = sql.find("\n", i)
+            if end == -1:
+                out.append(sql[i:])
+                i = n
+            else:
+                out.append(sql[i : end + 1])
+                i = end + 1
+            continue
+        if c == "?":
+            if used >= len(params):
+                raise ProbeDBError(
+                    f"参数数量不匹配：SQL 占位符多于提供的参数（已提供 {len(params)} 个）"
+                )
+            out.append(_param_literal(params[used]))
+            used += 1
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    if used != len(params):
+        raise ProbeDBError(
+            f"参数数量不匹配：SQL 占位符 {used} 个，提供参数 {len(params)} 个"
+        )
+    return "".join(out)
 
 
 class ProbeDBError(Exception):
@@ -55,6 +134,11 @@ class Result:
     @property
     def rows(self) -> list[list[str]]:
         return [list(row) for row in self._payload.get("rows", [])]
+
+    @property
+    def records(self) -> list[dict[str, str]]:
+        """按列名返回行（等价于 sqlite3.Row 的 dict 形式，便于迁移适配）。"""
+        return [dict(zip(self.columns, row)) for row in self.rows]
 
     @property
     def row_id(self) -> Optional[int]:
@@ -126,6 +210,7 @@ class ProbeDB:
     def __init__(self, handle: int):
         self._handle = handle
         self._lock = threading.Lock()
+        self._last_row_id: Optional[int] = None
 
     # ---------- 生命周期 ----------
 
@@ -161,20 +246,47 @@ class ProbeDB:
 
     # ---------- 执行 ----------
 
-    def execute(self, sql: str) -> Result:
-        """执行单条 SQL，返回 Result；失败抛 ProbeDBError。"""
-        results = self._execute_json(sql)
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None) -> Result:
+        """执行单条 SQL，返回 Result；失败抛 ProbeDBError。
+
+        params 提供时支持 SQLite 风格的 `?` 位置参数（在客户端安全拼成 SQL 字面量，
+        因为 ProbeDB 的 C ABI 目前没有独立的参数绑定接口）。
+
+        注意：ProbeDB 没有 NULL 类型，`None` 参数会明确报错而不是静默转换。
+        """
+        bound = bind_params(sql, params)
+        results = self._execute_json(bound)
         if not results:
             return Result({"type": "message", "text": ""})
         if len(results) > 1:
             raise ValueError(
                 f"SQL 包含 {len(results)} 条语句，请使用 execute_all() 获取全部结果"
             )
-        return Result(results[0])
+        result = Result(results[0])
+        if result.type == "inserted" and result.row_id is not None:
+            self._last_row_id = result.row_id
+        return result
 
-    def execute_all(self, sql: str) -> list[Result]:
+    def execute_all(self, sql: str, params: Optional[Sequence[Any]] = None) -> list[Result]:
         """执行一条或多条 SQL，返回全部 Result。"""
-        return [Result(payload) for payload in self._execute_json(sql)]
+        bound = bind_params(sql, params)
+        results = [Result(payload) for payload in self._execute_json(bound)]
+        for result in results:
+            if result.type == "inserted" and result.row_id is not None:
+                self._last_row_id = result.row_id
+        return results
+
+    def executescript(self, script: str) -> list[Result]:
+        """执行多语句脚本（对应 sqlite3 的 executescript，支持 -- 注释）。"""
+        return self.execute_all(script)
+
+    def commit(self) -> None:
+        """兼容 sqlite3 的 commit()。ProbeDB 每条写入即时生效，这里是 no-op。"""
+
+    @property
+    def last_row_id(self) -> Optional[int]:
+        """最近一次 INSERT 的行 ID（对应 sqlite3 的 lastrowid）。"""
+        return self._last_row_id
 
     def _execute_json(self, sql: str) -> list[dict[str, Any]]:
         ptr = self._call(self._lib.probedb_execute_json, sql.encode("utf-8"))

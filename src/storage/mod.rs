@@ -166,6 +166,11 @@ impl StorageEngine {
             .ok_or_else(|| format!("表 '{}' 不存在", table_name))
     }
 
+    /// 表是否存在（CREATE TABLE IF NOT EXISTS 用）
+    pub fn table_exists(&self, table_name: &str) -> bool {
+        self.schemas.contains_key(table_name)
+    }
+
     /// 获取自增计数器当前值（持久化用）
     pub fn next_id(&self) -> u64 {
         self.next_id

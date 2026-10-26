@@ -12,6 +12,7 @@ use crate::persistence::wal::WalLog;
 pub enum ExecuteResult {
     TableCreated { name: String },
     TableDropped { name: String },
+    IndexCreated { name: String },
     Inserted { row_id: u64 },
     Deleted { count: usize },
     Updated { count: usize },
@@ -55,7 +56,10 @@ impl Executor {
 
     fn execute_statement(&mut self, stmt: SQLStatement) -> Result<ExecuteResult, String> {
         match stmt {
-            SQLStatement::CreateTable { name, columns } => {
+            SQLStatement::CreateTable { name, columns, if_not_exists } => {
+                if if_not_exists && self.engine.table_exists(&name) {
+                    return Ok(ExecuteResult::TableCreated { name });
+                }
                 let schema = TableSchema {
                     name: name.clone(),
                     columns: columns.iter().enumerate().map(|(i, col)| {
@@ -73,6 +77,22 @@ impl Executor {
                 self.append_wal(&format!("T|{}|{}", name, cols.join("|")))?;
                 self.engine.create_table(schema)?;
                 Ok(ExecuteResult::TableCreated { name })
+            }
+
+            SQLStatement::CreateIndex { name, table, columns, if_not_exists } => {
+                // 兼容层：校验表/列存在并接受索引声明，但不建立物理索引（查询仍全表扫描）。
+                // IF NOT EXISTS 对同名索引直接视为成功。
+                let _ = if_not_exists;
+                let schema = self.engine.get_schema(&table)?;
+                for col in &columns {
+                    if !schema.columns.iter().any(|c| c.name == *col) {
+                        return Err(format!(
+                            "索引 '{}' 的列 '{}' 不存在于表 '{}'",
+                            name, col, table
+                        ));
+                    }
+                }
+                Ok(ExecuteResult::IndexCreated { name })
             }
 
             SQLStatement::DropTable { table_name } => {
@@ -217,17 +237,33 @@ impl Executor {
                     let right_schema = self.engine.get_schema(&jc.table)?.clone();
                     let right_rows = self.engine.scan_table(&jc.table)?.clone();
 
-                    // 解析连接列：left_col / right_col 可能是 "table.col" 或 "col" 形式
+                    // 解析连接列：left_col / right_col 可能是 "table.col" 或 "col" 形式。
+                    // ON 两侧的书写顺序不保证与 FROM/JOIN 顺序一致（SelfMind 的
+                    // `ON dh.entry_id = e.id` 就是右表在前），因此需要双向匹配。
                     let left_col_name = jc.left_col.rsplit('.').next().unwrap_or(&jc.left_col);
                     let right_col_name = jc.right_col.rsplit('.').next().unwrap_or(&jc.right_col);
 
-                    let left_ci = orig_schema.columns.iter().find(|c| c.name == left_col_name)
-                        .ok_or_else(|| format!("JOIN 左表列 '{}' 不存在", left_col_name))?;
-                    let right_ci = right_schema.columns.iter().find(|c| c.name == right_col_name)
-                        .ok_or_else(|| format!("JOIN 右表列 '{}' 不存在", right_col_name))?;
-
-                    let left_idx = left_ci.index;
-                    let right_idx = right_ci.index;
+                    let find_in = |schema: &TableSchema, name: &str| -> Option<usize> {
+                        schema.columns.iter().find(|c| c.name == name).map(|c| c.index)
+                    };
+                    let (left_idx, right_idx) = match (
+                        find_in(&orig_schema, left_col_name),
+                        find_in(&right_schema, right_col_name),
+                    ) {
+                        (Some(l), Some(r)) => (l, r),
+                        _ => match (
+                            find_in(&orig_schema, right_col_name),
+                            find_in(&right_schema, left_col_name),
+                        ) {
+                            (Some(l), Some(r)) => (l, r),
+                            _ => {
+                                return Err(format!(
+                                    "JOIN ON 列无法对应：'{}' / '{}'（左表 '{}'，右表 '{}'）",
+                                    jc.left_col, jc.right_col, table_name, jc.table
+                                ))
+                            }
+                        },
+                    };
 
                     // 合并 schema：左表列 + 右表列（右表列重命名为 table.col 避免冲突）
                     let mut merged_cols: Vec<ColumnInfo> = orig_schema.columns.clone();
@@ -1170,20 +1206,16 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
     }
 
     // 找到操作符位置
+    //
+    // 注意：不能因为操作符前一个字符是字母/下划线就跳过——`id='e1'`（无空格）
+    // 是合法 SQL，之前这里会把它误判为"列名中间"从而解析失败。
+    // 多字符操作符（>=/<=/!=）在数组里排在单字符前面，先匹配即可。
     let ops = [">=", "<=", "!=", "=", ">", "<"];
     let mut op_pos = None;
     let mut found_op = "";
 
     for op in &ops {
         if let Some(pos) = c.find(op) {
-            // 确保不是单词中间（比如"name"里的"= "不会有）
-            if pos > 0 {
-                let before = c.chars().nth(pos - 1).unwrap_or(' ');
-                if before.is_alphanumeric() || before == '_' || before == '`' {
-                    // 可能是在列名里的匹配，跳过
-                    continue;
-                }
-            }
             op_pos = Some(pos);
             found_op = op;
             break;
@@ -1290,9 +1322,15 @@ fn filter_rows_with_scores(
 
         let mut or_matched = Vec::new();
         for (row, score) in &rows {
-            let all_true = and_parts.iter().all(|cond| {
-                eval_condition(cond, row, schema).unwrap_or(false)
-            });
+            let mut all_true = true;
+            for cond in &and_parts {
+                // 谓词语法错误要显式报错，不能被 unwrap_or(false) 静默吞掉
+                // （例如暂不支持的 `IN (...)` 曾经会"查询成功但返回空集"）
+                if !eval_condition(cond, row, schema)? {
+                    all_true = false;
+                    break;
+                }
+            }
             if all_true {
                 or_matched.push((row.clone(), *score));
             }
@@ -1410,9 +1448,14 @@ fn filter_rows(rows: &[Row], where_clause: &str, schema: &TableSchema) -> Result
 
         let mut or_matched = Vec::new();
         for row in rows {
-            let all_true = and_parts.iter().all(|cond| {
-                eval_condition(cond, row, schema).unwrap_or(false)
-            });
+            let mut all_true = true;
+            for cond in &and_parts {
+                // 谓词语法错误显式报错（避免不支持的条件被静默当作"不命中"）
+                if !eval_condition(cond, row, schema)? {
+                    all_true = false;
+                    break;
+                }
+            }
             if all_true {
                 or_matched.push(row.clone());
             }
@@ -3748,6 +3791,103 @@ mod tests {
                 assert_eq!(rows[0][0], "a, b, c");
                 assert_eq!(rows[0][1], "x");
             }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    // ===== SelfMind 兼容性 =====
+
+    #[test]
+    fn test_create_table_if_not_exists_is_idempotent() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)"
+        ).unwrap()).unwrap();
+        // 第二次不应报错
+        executor.execute(parse_sql(
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap()).unwrap();
+        assert!(executor.execute(parse_sql("SELECT * FROM t").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_create_index_accepted_and_validates_columns() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE entries (id TEXT, status TEXT, type TEXT)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "CREATE INDEX IF NOT EXISTS idx_status ON entries(status)"
+        ).unwrap()).unwrap();
+        // 重复创建不报错
+        executor.execute(parse_sql(
+            "CREATE INDEX IF NOT EXISTS idx_status ON entries(status)"
+        ).unwrap()).unwrap();
+
+        // 不存在的列 → 明确报错
+        let err = executor.execute(parse_sql(
+            "CREATE INDEX idx_ghost ON entries(ghost)"
+        ).unwrap()).unwrap_err();
+        assert!(err.contains("ghost"), "{}", err);
+    }
+
+    #[test]
+    fn test_join_with_table_aliases() {
+        // SelfMind 风格：SELECT e.id FROM entries e INNER JOIN decay_history dh ON dh.entry_id = e.id
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE entries (id TEXT, content TEXT)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "CREATE TABLE decay_history (entry_id TEXT, decay_score FLOAT)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO entries (id, content) VALUES ('e1', 'hello')"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO entries (id, content) VALUES ('e2', 'world')"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO decay_history (entry_id, decay_score) VALUES ('e1', 0.5)"
+        ).unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql(
+            "SELECT e.id FROM entries e INNER JOIN decay_history dh ON dh.entry_id = e.id"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows, &vec![vec!["e1".to_string()]]);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_where_operator_without_spaces() {
+        // 参数化绑定会生成 `WHERE id='e1'`（操作符两侧无空格），必须能解析
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id TEXT, age INTEGER)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, age) VALUES ('e1', 30)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, age) VALUES ('e2', 40)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT id FROM t WHERE id='e1'").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows, &vec![vec!["e1".to_string()]]),
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let r = executor.execute(parse_sql("SELECT id FROM t WHERE age>35").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows, &vec![vec!["e2".to_string()]]),
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // UPDATE ... WHERE id='e1'（无空格）
+        executor.execute(parse_sql("UPDATE t SET age=31 WHERE id='e1'").unwrap()).unwrap();
+        let r = executor.execute(parse_sql("SELECT age FROM t WHERE id='e1'").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => assert_eq!(rows, &vec![vec!["31".to_string()]]),
             _ => panic!("Expected SelectResult"),
         }
     }

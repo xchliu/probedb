@@ -121,6 +121,9 @@ impl ProbeDB {
                 executor::ExecuteResult::TableDropped { name } => {
                     output.push(format!("表 '{}' 已删除", name));
                 }
+                executor::ExecuteResult::IndexCreated { name } => {
+                    output.push(format!("索引 '{}' 已接受（当前不建立物理索引）", name));
+                }
                 executor::ExecuteResult::Inserted { row_id } => {
                     output.push(format!("插入成功，行ID: {}", row_id));
                 }
@@ -179,6 +182,9 @@ fn execute_result_to_json(result: &executor::ExecuteResult) -> String {
         }
         R::TableDropped { name } => {
             format!("{{\"type\":\"table_dropped\",\"name\":\"{}\"}}", json_escape(name))
+        }
+        R::IndexCreated { name } => {
+            format!("{{\"type\":\"index_created\",\"name\":\"{}\"}}", json_escape(name))
         }
         R::Inserted { row_id } => {
             format!("{{\"type\":\"inserted\",\"row_id\":{}}}", row_id)

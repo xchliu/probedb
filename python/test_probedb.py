@@ -76,6 +76,80 @@ class BindingTests(unittest.TestCase):
                 rows = db.execute("SELECT note FROM t").rows
                 self.assertEqual(rows, [["It's a (test); ok"]])
 
+    # ---------- SelfMind 迁移前置能力 ----------
+
+    def test_param_binding(self):
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+            db.execute("INSERT INTO t (id, name) VALUES (?, ?)", (1, "alice"))
+            db.execute("INSERT INTO t (id, name) VALUES (?, ?)", (2, "bob"))
+            # 无空格 WHERE（参数绑定的典型产物）
+            self.assertEqual(db.execute("SELECT id FROM t WHERE id=?", (2,)).rows, [["2"]])
+            # LIKE 参数
+            self.assertEqual(db.execute("SELECT id FROM t WHERE name LIKE ?", ("%li%",)).rows, [["1"]])
+            # UPDATE ... WHERE ?（SelfMind 的 access_count 写法之外的基本形态）
+            db.execute("UPDATE t SET name=? WHERE id=?", ("carol", 1))
+            self.assertEqual(db.execute("SELECT name FROM t WHERE id=?", (1,)).rows, [["carol"]])
+            # 参数顺序不固化在 SQL 里
+            self.assertEqual(
+                db.execute("SELECT id FROM t WHERE name=? AND id=?", ("bob", 2)).rows, [["2"]]
+            )
+
+    def test_param_binding_errors(self):
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE t (id INTEGER)")
+            db.execute("INSERT INTO t (id) VALUES (1)")
+            with self.assertRaises(ProbeDBError):
+                db.execute("SELECT * FROM t WHERE id=?", ())  # 参数不足
+            with self.assertRaises(ProbeDBError):
+                db.execute("SELECT * FROM t WHERE id=?", (1, 2))  # 参数过多
+            with self.assertRaises(ProbeDBError):
+                db.execute("SELECT * FROM t WHERE id=?", (None,))  # 无 NULL 类型
+
+    def test_executescript_with_comments_and_if_not_exists(self):
+        with ProbeDB.open() as db:
+            script = (
+                "-- SelfMind schema 风格\n"
+                "CREATE TABLE IF NOT EXISTS t (id TEXT, status TEXT);\n"
+                "-- 索引\n"
+                "CREATE INDEX IF NOT EXISTS idx_status ON t(status);\n"
+            )
+            results = db.executescript(script)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0].type, "table_created")
+            self.assertEqual(results[1].type, "index_created")
+            # 幂等：再跑一遍不报错
+            self.assertEqual(len(db.executescript(script)), 2)
+
+    def test_table_alias_join(self):
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE entries (id TEXT, content TEXT)")
+            db.execute("CREATE TABLE decay_history (entry_id TEXT, decay_score FLOAT)")
+            db.execute("INSERT INTO entries (id, content) VALUES ('e1', 'hello')")
+            db.execute("INSERT INTO decay_history (entry_id, decay_score) VALUES ('e1', 0.5)")
+            # ON 两侧顺序与 FROM/JOIN 相反（SelfMind 的真实写法）
+            r = db.execute(
+                "SELECT e.id FROM entries e INNER JOIN decay_history dh "
+                "ON dh.entry_id = e.id"
+            )
+            self.assertEqual(r.rows, [["e1"]])
+
+    def test_unsupported_predicate_raises_not_silent(self):
+        # 不支持的条件必须报错，不能静默返回空集
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE t (id TEXT)")
+            db.execute("INSERT INTO t (id) VALUES ('a')")
+            with self.assertRaises(ProbeDBError) as ctx:
+                db.execute("SELECT id FROM t WHERE id IN ('a')")
+            self.assertIn("无法解析条件", str(ctx.exception))
+
+    def test_records_by_column_name(self):
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+            db.execute("INSERT INTO t (id, name) VALUES (1, 'alice')")
+            records = db.execute("SELECT id, name FROM t").records
+            self.assertEqual(records, [{"id": "1", "name": "alice"}])
+
 
 class MemoryToolTests(unittest.TestCase):
     def setUp(self):

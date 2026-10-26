@@ -83,6 +83,57 @@
 2. 补 `export` + 增量同步，为双写阶段做准备
 3. 协议升级：类型化行值 + 参数绑定（去掉 SQL 字符串拼接）
 
+### 第三轮（同日）：SelfMind Phase 5.5 迁移前置
+
+#### 背景
+- 坦哥调整优先级：先接入 SelfMind（智能体记忆系统，当前 SQLite）；苏格拉底（Hermes）已把
+  `docs/selfmind-integration-requirements.md` 写进本仓库（3 个阻断项 + 1 个增益项）。
+
+#### 完成
+- **SQL 兼容层**：`--` 行注释、`CREATE TABLE IF NOT EXISTS`、表级约束子句跳过、
+  `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`（校验表/列后接受，暂不建物理索引）。
+- **表别名**：`FROM entries e INNER JOIN decay_history dh ON dh.entry_id = e.id`；
+  同时修正 ON 两侧顺序与 FROM/JOIN 不一致（SelfMind 就是右表在前）。
+- **参数化 API（Python 绑定）**：`execute(sql, params=(...))`、`execute_all`、
+  `executescript`、`commit`、`last_row_id`、`Result.records`；`?` 在客户端安全转义。
+- **正确性修复**：`WHERE id='e1'`（操作符无空格）可解析；不支持的谓词（如 `IN`）
+  现在**显式报错**，不再被 `unwrap_or(false)` 吞掉导致"返回空集"。
+- **新增 `tools/selfmind_compat.py`**：SelfMind 4 条验收标准 + 已知缺口探测，可重复执行。
+- **新增 [docs/selfmind-migration-assessment.md](docs/selfmind-migration-assessment.md)**：
+  验收结果、实际 SQL 面差距、758MB 数据构成、三种迁移路线。
+
+#### 验收（`python3 tools/selfmind_compat.py`）
+- ✅ `SCHEMA_SQL` 初始化：20/20 语句；连续执行两次幂等
+- ✅ `CREATE INDEX IF NOT EXISTS` 不报错
+- ✅ 表别名 JOIN（右表在前的 ON）
+- ✅ 参数化查询（SELECT / LIKE / UPDATE，无空格 WHERE）
+- ✅ 全列 INSERT、`last_row_id`、`records`
+- 结果：**PASS**
+
+#### requirements 文档之外的新缺口（实测）
+- **NULL**：无 NULL 类型，`None` 参数报错（真实数据大量可空字段）→ P0
+- **省略自增 id 的 INSERT**：history/snapshots/decay/ops 都省略 `id` → P0
+- **DEFAULT / AUTOINCREMENT 语义**：DDL 接受但不生效
+- **表达式 UPDATE**：`access_count=access_count+1` → P1
+- **聚合列别名**：`COUNT(*) as cnt` / `AVG(...) as avg_decay` → P1
+- **IN 谓词**：recall scanner 使用 → P1（当前显式报错）
+
+#### 规模现实（关键风险）
+- `data/selfmind_hermes.db` = **758 MB / ~1.53M 行**：
+  entries 606 行/7 MB；entry_history 755k 行/429 MB；snapshots 23k/178 MB；operations_log 756k/104 MB。
+- ProbeDB 是全内存 + 全量快照：**只接 entries 可行**，history/snapshots/ops 全量接不可行。
+- 建议路线 A：entries 由 ProbeDB 承载，历史/日志继续 SQLite；先双读比对，再影子写。
+
+#### 测试
+- **Rust：225 passed, 0 failed**（+9：注释/IF NOT EXISTS/表约束/CREATE INDEX/别名/无空格 WHERE 等）
+- **Python：20 passed**（+6：参数绑定、参数错误、executescript、别名 JOIN、IN 显式报错、records）
+
+### 下一步（SelfMind）
+1. P0 能力：NULL 类型 + 部分列插入/DEFAULT/AUTOINCREMENT
+2. P1 能力：表达式 UPDATE、聚合列别名、IN
+3. 写 `ProbeDBStore` 适配层，用真实 606 条 entries 做双读比对
+4. 与坦哥确认历史/日志数据归属（建议保留 SQLite）
+
 ---
 
 ## 2026-10-23（周五：第9周结束 — 无新任务，阻塞第53天）

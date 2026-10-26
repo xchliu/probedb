@@ -9,6 +9,18 @@ pub enum SQLStatement {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        /// CREATE TABLE IF NOT EXISTS：表已存在时跳过而不是报错
+        if_not_exists: bool,
+    },
+    /// CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col, ...)
+    ///
+    /// 当前实现：校验表/列存在并登记索引名；查询暂不利用索引（全表扫描），
+    /// 属于"SQL 兼容层"而非性能索引。
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        if_not_exists: bool,
     },
     Insert {
         table_name: String,
@@ -59,7 +71,9 @@ pub struct JoinClause {
 
 /// 解析 SQL 文本（支持 CREATE TABLE / INSERT / SELECT）
 pub fn parse_sql(sql: &str) -> Result<Vec<SQLStatement>, String> {
-    let trimmed = sql.trim();
+    // 先去掉 `--` 行注释（字符串内部的 -- 保留）
+    let cleaned = strip_line_comments(sql);
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return Err("SQL语句为空".to_string());
     }
@@ -72,6 +86,43 @@ pub fn parse_sql(sql: &str) -> Result<Vec<SQLStatement>, String> {
         result.push(parse_one(&stmt)?);
     }
     Ok(result)
+}
+
+/// 去除 SQL 行注释 `-- ...`（引号内不处理），保留换行以维持语句边界。
+fn strip_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut in_quote = false;
+    while let Some(c) = chars.next() {
+        if in_quote {
+            out.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    out.push(chars.next().expect("peek 已确认存在"));
+                    continue;
+                }
+                in_quote = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_quote = true;
+                out.push(c);
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next(); // 吃掉第二个 '-'
+                while let Some(&n) = chars.peek() {
+                    if n == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// 按分号拆分语句，跳过单引号字符串内部；支持 SQL 标准 `''` 转义。
@@ -112,7 +163,9 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 fn parse_one(sql: &str) -> Result<SQLStatement, String> {
     let upper = sql.trim().to_uppercase();
 
-    if upper.starts_with("CREATE TABLE") {
+    if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") {
+        parse_create_index(sql)
+    } else if upper.starts_with("CREATE TABLE") {
         parse_create_table(sql)
     } else if upper.starts_with("INSERT INTO") {
         parse_insert(sql)
@@ -130,13 +183,16 @@ fn parse_one(sql: &str) -> Result<SQLStatement, String> {
 }
 
 /// 解析 CREATE TABLE 语句
-/// CREATE TABLE name (col1 TYPE1, col2 TYPE2, ...)
+/// CREATE TABLE [IF NOT EXISTS] name (col1 TYPE1, col2 TYPE2, ...)
 fn parse_create_table(sql: &str) -> Result<SQLStatement, String> {
     let rest = sql.trim()
         .strip_prefix("CREATE TABLE")
         .or_else(|| sql.trim().strip_prefix("create table"))
         .ok_or_else(|| "无法解析CREATE TABLE".to_string())?
         .trim();
+
+    // 可选 IF NOT EXISTS
+    let (if_not_exists, rest) = strip_if_not_exists(rest);
 
     // 提取表名（第一个单词）
     let (name, rest) = split_first_word(rest)?;
@@ -180,13 +236,91 @@ fn parse_create_table(sql: &str) -> Result<SQLStatement, String> {
         column_strs.push(current.trim().to_string());
     }
 
+    // 表级约束（FOREIGN KEY / PRIMARY KEY / UNIQUE / CHECK / CONSTRAINT）当前不建模，
+    // 直接跳过——否则会被当成列定义解析失败（SelfMind schema 需要）。
     let columns: Result<Vec<ColumnDef>, String> = column_strs.iter()
+        .filter(|col| !is_table_constraint(col))
         .map(|col| parse_column_def(col.trim()))
         .collect();
 
     Ok(SQLStatement::CreateTable {
         name: name.to_lowercase(),
         columns: columns?,
+        if_not_exists,
+    })
+}
+
+/// 去掉可选的 `IF NOT EXISTS` 前缀（大小写不敏感），返回 (是否存在, 剩余部分)
+fn strip_if_not_exists(s: &str) -> (bool, &str) {
+    let t = s.trim();
+    const PREFIX: &str = "IF NOT EXISTS";
+    if t.len() >= PREFIX.len() && t[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        (true, t[PREFIX.len()..].trim())
+    } else {
+        (false, t)
+    }
+}
+
+/// 是否是 CREATE TABLE 里的表级约束子句（当前不建模，直接忽略）
+fn is_table_constraint(clause: &str) -> bool {
+    let upper = clause.trim().to_uppercase();
+    ["FOREIGN KEY", "PRIMARY KEY", "UNIQUE (", "UNIQUE(", "CHECK (", "CHECK(", "CONSTRAINT "]
+        .iter()
+        .any(|prefix| upper.starts_with(prefix))
+}
+
+/// 解析 CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col, ...)
+///
+/// 当前只接受并校验（表/列存在），不建立物理索引——查询仍是全表扫描。
+/// 目的是兼容 SelfMind 的 schema 初始化脚本。
+fn parse_create_index(sql: &str) -> Result<SQLStatement, String> {
+    let s = sql.trim();
+    let rest = if let Some(r) = s.strip_prefix("CREATE UNIQUE INDEX")
+        .or_else(|| s.strip_prefix("create unique index"))
+    {
+        r.trim()
+    } else {
+        s.strip_prefix("CREATE INDEX")
+            .or_else(|| s.strip_prefix("create index"))
+            .ok_or_else(|| "无法解析CREATE INDEX".to_string())?
+            .trim()
+    };
+
+    let (if_not_exists, rest) = strip_if_not_exists(rest);
+    let (name, rest) = split_first_word(rest)?;
+    let rest = rest.trim();
+
+    let upper = rest.to_uppercase();
+    if !upper.starts_with("ON ") {
+        return Err("CREATE INDEX 缺少 ON 子句".to_string());
+    }
+    let after_on = rest[3..].trim();
+    // 注意 `ON entries(status)` 表名与括号之间可能没有空格
+    let paren_pos = after_on.find('(')
+        .ok_or_else(|| "CREATE INDEX 缺少列清单括号".to_string())?;
+    let table_part = after_on[..paren_pos].trim();
+    let (table, table_alias) = split_first_word(table_part)?;
+    let _ = table_alias; // 索引定义允许表别名，忽略
+    let after_table = after_on[paren_pos..].trim();
+
+    if !after_table.starts_with('(') {
+        return Err("CREATE INDEX 缺少列清单括号".to_string());
+    }
+    let (cols_str, _) = split_parenthesized(after_table)?;
+    let columns: Vec<String> = cols_str
+        .split(',')
+        .map(|c| c.trim().to_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if columns.is_empty() {
+        return Err("CREATE INDEX 列清单为空".to_string());
+    }
+
+    Ok(SQLStatement::CreateIndex {
+        name: name.to_lowercase(),
+        table: table.to_lowercase(),
+        columns,
+        if_not_exists,
     })
 }
 
@@ -321,8 +455,8 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     // 提取 FROM 后面的部分
     let rest_after_from = rest[from_pos + 6..].trim();
 
-    // 提取表名
-    let (table_name, rest_after_table) = split_first_word(rest_after_from)?;
+    // 提取表名（支持 table alias，如 `FROM entries e`）
+    let (table_name, rest_after_table) = split_table_ref(rest_after_from)?;
 
     let mut where_clause = None;
     let mut order_by = None;
@@ -335,23 +469,34 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
     let mut remaining = rest_after_table.trim().to_string();
 
     // ===== JOIN 解析 =====
-    // 语法: INNER JOIN table ON left_col = right_col
+    // 语法: [INNER] JOIN table [alias] ON left_col = right_col
     // JOIN 必须在 WHERE 之前解析
     let upper_check = remaining.to_uppercase();
-    let join_pos = upper_check.find(" INNER JOIN ")
-        .or_else(|| upper_check.find(" JOIN "));
-    if let Some(jpos) = join_pos {
-        // JOIN 关键词前的部分保留为 remaining（供 WHERE 等后续解析）
-        let after_join_kw = if upper_check[jpos..].starts_with(" INNER JOIN ") {
-            remaining[jpos + 12..].trim().to_string()
+    let join_match: Option<(usize, usize)> = if let Some(p) = upper_check.find(" INNER JOIN ") {
+        Some((p, 12))
+    } else if let Some(p) = upper_check.find(" JOIN ") {
+        Some((p, 6))
+    } else if upper_check.starts_with("INNER JOIN ") {
+        Some((0, 11))
+    } else if upper_check.starts_with("JOIN ") {
+        Some((0, 5))
+    } else {
+        None
+    };
+    if let Some((jpos, kw_len)) = join_match {
+        // JOIN 关键词后面的部分：table [alias] ON ...
+        let after_join_kw = remaining[jpos + kw_len..].trim().to_string();
+        // 解析 JOIN 表名（支持别名，如 `decay_history dh`）
+        let (join_table, after_join_table) = split_table_ref(&after_join_kw)?;
+        let after_join_table = after_join_table.trim().to_string();
+        let after_table_upper = after_join_table.to_uppercase();
+        let after_on = if after_table_upper.starts_with("ON ") {
+            after_join_table[3..].trim().to_string()
+        } else if let Some(p) = after_table_upper.find(" ON ") {
+            after_join_table[p + 4..].trim().to_string()
         } else {
-            remaining[jpos + 6..].trim().to_string()
+            return Err("JOIN 缺少 ON 子句".to_string());
         };
-        // JOIN 后面到 ON 之间是表名
-        let on_pos = after_join_kw.to_uppercase().find(" ON ")
-            .ok_or_else(|| "JOIN 缺少 ON 子句".to_string())?;
-        let join_table = after_join_kw[..on_pos].trim().to_lowercase();
-        let after_on = after_join_kw[on_pos + 4..].trim().to_string();
         // ON left_col = right_col —— 找到等号
         // 先找后续子句的开始位置，截取 ON 条件
         let after_on_upper = after_on.to_uppercase();
@@ -754,6 +899,31 @@ fn split_first_word(s: &str) -> Result<(String, &str), String> {
     Ok((s[..end].to_string(), s[end..].trim()))
 }
 
+/// 解析表引用 `table [alias]`，返回 (表名, 别名之后的剩余 SQL)。
+///
+/// 列限定名（`e.id` / `dh.entry_id`）在投影/WHERE/ORDER/ON 解析时已按 `.` 前缀剥离，
+/// 因此别名只需在表名解析阶段被识别并丢弃，避免出现"表 'decay_history dh' 不存在"。
+fn split_table_ref(s: &str) -> Result<(String, &str), String> {
+    let (table, rest) = split_first_word(s)?;
+    let table = table.to_lowercase();
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok((table, rest));
+    }
+    // 第二个 token 若为子句关键字，则不是别名
+    let (next, after_next) = split_first_word(rest)?;
+    let next_upper = next.to_uppercase();
+    const KEYWORDS: [&str; 14] = [
+        "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "JOIN", "ON", "USING", "WHERE",
+        "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET",
+    ];
+    if KEYWORDS.contains(&next_upper.as_str()) {
+        Ok((table, rest))
+    } else {
+        Ok((table, after_next.trim()))
+    }
+}
+
 /// 拆分括号内的内容和剩余部分
 fn split_parenthesized(s: &str) -> Result<(String, String), String> {
     let s = s.trim();
@@ -862,7 +1032,7 @@ mod tests {
     fn test_parse_create_table() {
         let stmts = parse_sql("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)").unwrap();
         match &stmts[0] {
-            SQLStatement::CreateTable { name, columns } => {
+            SQLStatement::CreateTable { name, columns, .. } => {
                 assert_eq!(name, "users");
                 assert_eq!(columns.len(), 3);
                 assert_eq!(columns[0].data_type, DataType::Integer);
@@ -1141,6 +1311,77 @@ mod tests {
                 assert_eq!(where_clause.as_deref(), Some("id = 2"));
             }
             _ => panic!("Expected Update"),
+        }
+    }
+
+    // ===== SelfMind 兼容：注释 / IF NOT EXISTS / 表级约束 / CREATE INDEX / 表别名 =====
+
+    #[test]
+    fn test_parse_sql_skips_line_comments() {
+        let stmts = parse_sql(
+            "-- 建表注释\nCREATE TABLE t (id INTEGER); -- 尾部注释\nSELECT id FROM t"
+        ).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(stmts[0], SQLStatement::CreateTable { .. }));
+        assert!(matches!(stmts[1], SQLStatement::Select { .. }));
+    }
+
+    #[test]
+    fn test_parse_create_table_if_not_exists() {
+        let stmts = parse_sql("CREATE TABLE IF NOT EXISTS t (id INTEGER)").unwrap();
+        match &stmts[0] {
+            SQLStatement::CreateTable { name, if_not_exists, .. } => {
+                assert_eq!(name, "t");
+                assert!(*if_not_exists);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_table_skips_table_constraints() {
+        let stmts = parse_sql(
+            "CREATE TABLE t (id INTEGER, entry_id TEXT, FOREIGN KEY (entry_id) REFERENCES other(id))"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::CreateTable { columns, .. } => {
+                assert_eq!(columns.len(), 2, "表级 FOREIGN KEY 应被跳过: {:?}", columns);
+                assert_eq!(columns[1].name, "entry_id");
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_index() {
+        let stmts = parse_sql(
+            "CREATE INDEX IF NOT EXISTS idx_entries_type ON entries(type)"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::CreateIndex { name, table, columns, if_not_exists } => {
+                assert_eq!(name, "idx_entries_type");
+                assert_eq!(table, "entries");
+                assert_eq!(columns, &vec!["type".to_string()]);
+                assert!(*if_not_exists);
+            }
+            _ => panic!("Expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn test_parse_join_with_table_aliases() {
+        let stmts = parse_sql(
+            "SELECT e.id FROM entries e INNER JOIN decay_history dh ON dh.entry_id = e.id"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Select { table_name, join, .. } => {
+                assert_eq!(table_name, "entries");
+                let jc = join.as_ref().expect("应有 JOIN");
+                assert_eq!(jc.table, "decay_history");
+                assert_eq!(jc.left_col, "dh.entry_id");
+                assert_eq!(jc.right_col, "e.id");
+            }
+            _ => panic!("Expected Select"),
         }
     }
 }
