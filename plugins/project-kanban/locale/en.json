@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Project Kanban",
+    "description": "Live R&D progress board for in-flight projects: scans project docs, goals, and git repositories on the Host and renders one kanban panel in the Web UI."
+  }
+}

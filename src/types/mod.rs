@@ -34,6 +34,8 @@ impl fmt::Display for DataType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// SQL NULL（列可空；当前不强制 NOT NULL）
+    Null,
     Integer(i64),
     Float(f64),
     Text(String),
@@ -48,6 +50,7 @@ pub enum Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Null => write!(f, "NULL"),
             Value::Integer(v) => write!(f, "{}", v),
             Value::Float(v) => write!(f, "{}", v),
             Value::Text(v) => write!(f, "{}", v),

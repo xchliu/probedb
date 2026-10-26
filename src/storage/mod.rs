@@ -368,6 +368,7 @@ pub(crate) fn decode_type(s: &str) -> Result<DataType, String> {
 /// 编码值为字符串（显式类型标记）
 pub(crate) fn encode_value(v: &Value) -> String {
     match v {
+        Value::Null => "NULL".to_string(),
         Value::Integer(n) => format!("INT:{}", n),
         Value::Float(f) => format!("FLOAT:{}", f),
         Value::Text(s) => format!("TEXT:{}", escape_text(s)),
@@ -383,6 +384,9 @@ pub(crate) fn encode_value(v: &Value) -> String {
 
 /// 解码值
 pub(crate) fn decode_value(s: &str) -> Result<Value, String> {
+    if s == "NULL" {
+        return Ok(Value::Null);
+    }
     if let Some(rest) = s.strip_prefix("INT:") {
         return rest.parse::<i64>().map(Value::Integer)
             .map_err(|_| format!("整数解析失败: {}", s));
@@ -478,6 +482,8 @@ fn unescape_text(s: &str) -> String {
 /// 检查值是否匹配列类型
 fn type_matches(col_type: &DataType, value: &Value) -> bool {
     match (col_type, value) {
+        // NULL 可写入任何列（当前未建模 NOT NULL 约束）
+        (_, Value::Null) => true,
         (DataType::Integer, Value::Integer(_)) => true,
         (DataType::Float, Value::Float(_))
         | (DataType::Float, Value::Integer(_)) => true, // Integer 可以隐式转 Float
@@ -510,6 +516,10 @@ pub fn unquote_sql_literal(s: &str) -> String {
 
 /// 将字符串值解析为对应的 Value
 pub fn parse_value(value_str: &str, col_type: &DataType) -> Result<Value, String> {
+    // 未加引号的 NULL 关键字 → SQL NULL；带引号的 'NULL' 仍是普通文本
+    if value_str.trim().eq_ignore_ascii_case("NULL") {
+        return Ok(Value::Null);
+    }
     let clean = unquote_sql_literal(value_str);
     match col_type {
         DataType::Integer => {

@@ -38,12 +38,12 @@ def sql_literal(value: str) -> str:
 def _param_literal(value: Any) -> str:
     """把 Python 参数转成 SQL 字面量。
 
-    - None：ProbeDB 无 NULL 类型，明确报错（避免把 None 静默变成空串/0）
+    - None：转成 SQL `NULL`
     - bool / int / float：直接输出（bool → 1/0，与 SQLite 一致）
     - str：'' 转义
     """
     if value is None:
-        raise ProbeDBError("ProbeDB 暂不支持 NULL 参数（无 NULL 类型）")
+        return "NULL"
     if isinstance(value, bool):
         return "1" if value else "0"
     if isinstance(value, int):
@@ -252,7 +252,8 @@ class ProbeDB:
         params 提供时支持 SQLite 风格的 `?` 位置参数（在客户端安全拼成 SQL 字面量，
         因为 ProbeDB 的 C ABI 目前没有独立的参数绑定接口）。
 
-        注意：ProbeDB 没有 NULL 类型，`None` 参数会明确报错而不是静默转换。
+        注意：`None` 会转成 SQL NULL；查询结果里的 NULL 目前以字符串 "NULL" 返回
+        （行值协议尚未类型化）。
         """
         bound = bind_params(sql, params)
         results = self._execute_json(bound)

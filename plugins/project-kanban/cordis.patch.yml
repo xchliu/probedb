@@ -1,0 +1,5 @@
+# 项目看板：Host 扫描器 + Web UI 主面板。
+- insert:
+    - id: project-kanban
+      name: '@local/project-kanban'
+      config: {}

@@ -1,0 +1,14 @@
+{
+  "projectsRoot": "~/Documents/aiworkspace/aiknowledge",
+  "reposRoot": "~/Documents/aiworkspace",
+  "repoDeny": [
+    "archive",
+    "docs",
+    "aiknowledge",
+    "node_modules",
+    "target"
+  ],
+  "excludePaths": [
+    "projects/企业AI体系建设"
+  ]
+}

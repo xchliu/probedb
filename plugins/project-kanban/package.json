@@ -1,0 +1,34 @@
+{
+  "name": "@local/project-kanban",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "在途项目研发进展看板：Host 扫描项目文档/目标/代码库，Web UI 主面板渲染看板",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "host/scan.js",
+    "client.js",
+    "cordis.patch.yml",
+    "config.json",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

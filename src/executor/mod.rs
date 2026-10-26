@@ -208,6 +208,34 @@ impl Executor {
                     let col = schema.columns.iter()
                         .find(|c| c.name == *col_name)
                         .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+
+                    // 自增/自减表达式：UPDATE t SET access_count=access_count+1
+                    if let Some((expr_col, delta)) = parse_increment_expression(val_str) {
+                        if expr_col != *col_name && expr_col != col.name {
+                            return Err(format!(
+                                "暂只支持对同一列做自增/自减：'{}' = '{}'",
+                                col_name, val_str
+                            ));
+                        }
+                        for row in &matched {
+                            let current = row.values.get(col.index)
+                                .ok_or_else(|| format!("列 '{}' 没有值", col_name))?;
+                            let new_value = match current {
+                                Value::Integer(n) => Value::Integer(n + delta),
+                                Value::Float(f) => Value::Float(f + delta as f64),
+                                _ => return Err(format!("自增/自减只支持数值列: '{}'", col_name)),
+                            };
+                            let encoded = crate::storage::encode_value(&new_value);
+                            self.append_wal(&format!(
+                                "U|{}|{}|{}|{}", table_name, row.id, col.index, encoded
+                            ))?;
+                            total_updated += self.engine.update_by_ids(
+                                &table_name, &[row.id], col.index, new_value
+                            )?;
+                        }
+                        continue;
+                    }
+
                     let value = parse_value(val_str, &col.data_type)
                         .map_err(|e| format!("解析更新值 '{}' 失败: {}", val_str, e))?;
                     // WAL 先写（U 记录），成功后改内存
@@ -335,24 +363,61 @@ impl Executor {
                 // SELECT *          → 所有列
                 // SELECT col1, col2 → 仅指定列
                 // SELECT COUNT(*)   → 聚合，返回单行单列
-                let upper_cols: Vec<String> = columns.iter()
-                    .map(|c| c.trim().to_uppercase()).collect();
+                // 支持 `expr AS alias`（COUNT(*) as cnt / AVG(x) as avg_decay）
+                let parsed_cols: Vec<(String, Option<String>)> = columns.iter()
+                    .map(|c| split_column_alias(c))
+                    .collect();
+                let upper_cols: Vec<String> = parsed_cols.iter()
+                    .map(|(expr, _)| expr.trim().to_uppercase()).collect();
 
-                // COUNT(*) 聚合
-                if upper_cols.len() == 1 && (upper_cols[0] == "COUNT(*)" || upper_cols[0] == "COUNT (*)") {
-                    let count = scored_rows.len();
-                    return Ok(ExecuteResult::SelectResult {
-                        columns: vec!["count".to_string()],
-                        rows: vec![vec![count.to_string()]],
-                    });
-                }
+                // 单列聚合：COUNT(*) / COUNT(DISTINCT col) / SUM / AVG / MIN / MAX
+                if parsed_cols.len() == 1 {
+                    let (expr, alias) = &parsed_cols[0];
+                    let expr_trimmed = expr.trim();
+                    let upper = expr_trimmed.to_uppercase();
 
-                // SUM/AVG/MIN/MAX 聚合（单列）
-                if upper_cols.len() == 1 {
-                    let col_trimmed = columns[0].trim();
-                    let upper = col_trimmed.to_uppercase();
-                    let agg = parse_aggregate(&upper);
-                    if let Some(agg_fn) = agg {
+                    // COUNT(*)
+                    if upper == "COUNT(*)" || upper == "COUNT (*)" {
+                        let label = alias.clone().unwrap_or_else(|| "count".to_string());
+                        let count = scored_rows.len();
+                        return Ok(ExecuteResult::SelectResult {
+                            columns: vec![label],
+                            rows: vec![vec![count.to_string()]],
+                        });
+                    }
+
+                    // COUNT(DISTINCT col)
+                    if upper.starts_with("COUNT(DISTINCT ") && upper.ends_with(')') {
+                        let inner = if let (Some(lp), Some(rp)) = (expr_trimmed.find('('), expr_trimmed.rfind(')')) {
+                            expr_trimmed[lp + 1..rp].trim()
+                        } else {
+                            ""
+                        };
+                        let col_name = inner
+                            .strip_prefix("DISTINCT")
+                            .or_else(|| inner.strip_prefix("distinct"))
+                            .unwrap_or(inner)
+                            .trim()
+                            .to_lowercase();
+                        let ci = schema.columns.iter().find(|c| c.name == col_name)
+                            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for (row, _) in &scored_rows {
+                            if let Some(v) = row.values.get(ci.index) {
+                                if !matches!(v, Value::Null) {
+                                    seen.insert(v.to_string());
+                                }
+                            }
+                        }
+                        let label = alias.clone().unwrap_or_else(|| "count".to_string());
+                        return Ok(ExecuteResult::SelectResult {
+                            columns: vec![label],
+                            rows: vec![vec![seen.len().to_string()]],
+                        });
+                    }
+
+                    // SUM/AVG/MIN/MAX 聚合（单列）
+                    if let Some(agg_fn) = parse_aggregate(&upper) {
                         let inner_col = extract_agg_column(&upper);
                         let col_name = inner_col.trim().to_lowercase();
                         let ci = schema.columns.iter().find(|c| c.name == col_name)
@@ -393,8 +458,9 @@ impl Executor {
                             format!("{}", agg_value)
                         };
 
+                        let label = alias.clone().unwrap_or_else(|| agg_name.to_string());
                         return Ok(ExecuteResult::SelectResult {
-                            columns: vec![agg_name.to_string()],
+                            columns: vec![label],
                             rows: vec![vec![value_str]],
                         });
                     }
@@ -403,14 +469,14 @@ impl Executor {
                 // 解析列投影（* 或具体列名）
                 let proj_indices: Vec<usize>;
                 let proj_names: Vec<String>;
-                if columns.len() == 1 && columns[0] == "*" {
+                if parsed_cols.len() == 1 && parsed_cols[0].0.trim() == "*" {
                     proj_indices = schema.columns.iter().map(|c| c.index).collect();
                     proj_names = schema.columns.iter().map(|c| c.name.clone()).collect();
                 } else {
                     let mut idxs = Vec::new();
                     let mut names = Vec::new();
-                    for col_name in &columns {
-                        let col_name = col_name.trim();
+                    for (expr, alias) in &parsed_cols {
+                        let col_name = expr.trim();
                         if col_name == "*" {
                             // 混合 SELECT *, name — 展开所有列
                             for ci in &schema.columns {
@@ -429,7 +495,7 @@ impl Executor {
                                 })
                                 .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
                             idxs.push(ci.index);
-                            names.push(ci.name.clone());
+                            names.push(alias.clone().unwrap_or_else(|| ci.name.clone()));
                         }
                     }
                     proj_indices = idxs;
@@ -583,13 +649,14 @@ fn execute_group_by(
 
     let mut select_items: Vec<SelectItem> = Vec::new();
     for col in columns {
-        let col_trimmed = col.trim();
+        let (expr, alias) = split_column_alias(col);
+        let col_trimmed = expr.trim();
         let upper = col_trimmed.to_uppercase();
 
         // COUNT(*)
         if upper == "COUNT(*)" || upper == "COUNT (*)" {
             select_items.push(SelectItem {
-                label: "count".to_string(),
+                label: alias.unwrap_or_else(|| "count".to_string()),
                 is_agg: true,
                 agg_fn: None,
                 col_name: String::new(),
@@ -616,7 +683,7 @@ fn execute_group_by(
                 AggFunc::Max => "max",
             };
             select_items.push(SelectItem {
-                label: agg_name.to_string(),
+                label: alias.unwrap_or_else(|| agg_name.to_string()),
                 is_agg: true,
                 agg_fn: Some(agg_fn),
                 col_name,
@@ -644,7 +711,7 @@ fn execute_group_by(
         }
 
         select_items.push(SelectItem {
-            label: col_name.clone(),
+            label: alias.unwrap_or_else(|| col_name.clone()),
             is_agg: false,
             agg_fn: None,
             col_name,
@@ -1083,9 +1150,52 @@ fn get_column_value<'a>(row: &'a Row, col_name: &str, schema: &TableSchema) -> R
         .ok_or_else(|| format!("列 '{}' 没有值", col_name))
 }
 
+/// 拆分 SELECT 列表达式与别名：`COUNT(*) as cnt` → ("COUNT(*)", Some("cnt"))
+fn split_column_alias(col: &str) -> (String, Option<String>) {
+    let c = col.trim();
+    if let Some(pos) = find_ascii_ci(c, " AS ") {
+        let expr = c[..pos].trim();
+        let alias = c[pos + 4..].trim();
+        if !expr.is_empty() && !alias.is_empty() {
+            return (expr.to_string(), Some(alias.to_string()));
+        }
+    }
+    (c.to_string(), None)
+}
+
+/// 解析自增/自减 UPDATE 表达式：`access_count+1` / `access_count - 2` → ("access_count", ±n)
+fn parse_increment_expression(s: &str) -> Option<(String, i64)> {
+    let s = s.trim();
+    let (pos, sign) = if let Some(p) = s.find('+') {
+        (p, 1)
+    } else if let Some(p) = s.find('-') {
+        // 负数/日期里的 '-'（date 类型不会走到这里）需要左侧非空
+        (p, -1)
+    } else {
+        return None;
+    };
+    if pos == 0 {
+        return None;
+    }
+    let left = s[..pos].trim();
+    let right = s[pos + 1..].trim();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    if !left.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return None;
+    }
+    let delta: i64 = right.parse().ok()?;
+    Some((left.to_lowercase(), sign * delta))
+}
+
 /// 解析一个字面量值（数字、字符串、布尔、浮点数）
 fn parse_literal(s: &str) -> Value {
     let s = s.trim();
+    // NULL 字面量（裸词，大小写不敏感）
+    if s.eq_ignore_ascii_case("NULL") {
+        return Value::Null;
+    }
     // 字符串（带引号）
     if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
         return Value::Text(s[1..s.len()-1].to_string());
@@ -1174,8 +1284,74 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 
         // — 类型不匹配且无强制转换规则：不可比较 —
         // Integer/Float ↔ Date/Time/Text、Boolean ↔ Date/Time、Date ↔ Time、Vector ↔ 任何
+        // — NULL 与任何值（含 NULL）都不可比较：`=` 不命中、`!=` 命中 —
+        (Value::Null, _) | (_, Value::Null) => None,
         _ => None,
     }
+}
+
+/// 大小写不敏感的 ASCII 子串查找，返回字节位置（needle 必须是 ASCII）。
+///
+/// 不用 `to_uppercase()` 是因为非 ASCII 字符大写后长度可能变化，导致位置错位。
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let hay = haystack.as_bytes();
+    let ndl = needle.as_bytes();
+    if ndl.is_empty() || hay.len() < ndl.len() {
+        return None;
+    }
+    (0..=hay.len() - ndl.len()).find(|&i| {
+        hay[i..i + ndl.len()]
+            .iter()
+            .zip(ndl.iter())
+            .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+    })
+}
+
+/// 识别 `col IN (...)` / `col NOT IN (...)`，返回 (左侧列表达式, 右侧括号串, 是否 NOT IN)。
+fn split_in_condition(c: &str) -> Option<(&str, &str, bool)> {
+    if let Some(pos) = find_ascii_ci(c, " NOT IN ") {
+        return Some((&c[..pos], &c[pos + 8..], true));
+    }
+    if let Some(pos) = find_ascii_ci(c, " NOT IN(") {
+        return Some((&c[..pos], &c[pos + 8..], true));
+    }
+    if let Some(pos) = find_ascii_ci(c, " IN ") {
+        return Some((&c[..pos], &c[pos + 4..], false));
+    }
+    if let Some(pos) = find_ascii_ci(c, " IN(") {
+        return Some((&c[..pos], &c[pos + 4..], false));
+    }
+    None
+}
+
+/// 按顶层逗号拆分 SQL 字面量列表（引号内的逗号不拆，支持 `''`）
+fn split_sql_list(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, ch)) = iter.next() {
+        if in_quote {
+            if ch == '\'' {
+                if let Some(&(_, '\'')) = iter.peek() {
+                    iter.next();
+                    continue;
+                }
+                in_quote = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_quote = true,
+            ',' => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// 求值单个条件（支持普通列比较 + vector_similarity 原生函数）
@@ -1188,8 +1364,43 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
         return eval_vector_similarity_condition(c, row, schema);
     }
 
+    // IS NULL / IS NOT NULL
+    if let Some(pos) = find_ascii_ci(c, " IS NOT NULL") {
+        let col_name = c[..pos].trim();
+        let col_val = get_column_value(row, col_name, schema)?;
+        return Ok(!matches!(col_val, Value::Null));
+    }
+    if let Some(pos) = find_ascii_ci(c, " IS NULL") {
+        let col_name = c[..pos].trim();
+        let col_val = get_column_value(row, col_name, schema)?;
+        return Ok(matches!(col_val, Value::Null));
+    }
+
+    // IN / NOT IN（右侧为字面量列表；子查询暂不支持）
+    if let Some((left, right, negated)) = split_in_condition(c) {
+        let col_name = left.trim();
+        let inner = right.trim();
+        if !inner.starts_with('(') || !inner.ends_with(')') {
+            return Err(format!("IN 条件右侧必须是括号列表: {}", inner));
+        }
+        let list_str = &inner[1..inner.len() - 1];
+        let col_val = get_column_value(row, col_name, schema)?;
+        let mut found = false;
+        for item in split_sql_list(list_str) {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if compare_values(col_val, &parse_literal(item)) == Some(std::cmp::Ordering::Equal) {
+                found = true;
+                break;
+            }
+        }
+        return Ok(if negated { !found } else { found });
+    }
+
     // 处理 LIKE 操作
-    if let Some(pos) = c.to_uppercase().find(" LIKE ") {
+    if let Some(pos) = find_ascii_ci(c, " LIKE ") {
         let col_name = c[..pos].trim();
         let pattern = c[pos + 6..].trim().trim_matches('\'');
         let col_val = get_column_value(row, col_name, schema)?;
@@ -1201,6 +1412,7 @@ fn eval_condition(condition: &str, row: &Row, schema: &TableSchema) -> Result<bo
             Value::Date(d) => d.clone(),
             Value::Time(t) => t.clone(),
             Value::Vector(_) => return Ok(false),
+            Value::Null => return Ok(false),
         };
         return Ok(like_match(&text, pattern));
     }

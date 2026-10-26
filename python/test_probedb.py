@@ -103,8 +103,15 @@ class BindingTests(unittest.TestCase):
                 db.execute("SELECT * FROM t WHERE id=?", ())  # 参数不足
             with self.assertRaises(ProbeDBError):
                 db.execute("SELECT * FROM t WHERE id=?", (1, 2))  # 参数过多
-            with self.assertRaises(ProbeDBError):
-                db.execute("SELECT * FROM t WHERE id=?", (None,))  # 无 NULL 类型
+
+    def test_param_binding_null(self):
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE t (id INTEGER, note TEXT)")
+            db.execute("INSERT INTO t (id, note) VALUES (?, ?)", (1, None))
+            db.execute("INSERT INTO t (id, note) VALUES (?, ?)", (2, "x"))
+            self.assertEqual(db.execute("SELECT note FROM t WHERE id=?", (1,)).rows, [["NULL"]])
+            self.assertEqual(db.execute("SELECT id FROM t WHERE note IS NULL").rows, [["1"]])
+            self.assertEqual(db.execute("SELECT id FROM t WHERE note IS NOT NULL").rows, [["2"]])
 
     def test_executescript_with_comments_and_if_not_exists(self):
         with ProbeDB.open() as db:
