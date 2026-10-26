@@ -148,6 +148,85 @@ impl ProbeDB {
         }
         Ok(output.join("\n"))
     }
+
+    /// 执行 SQL 语句，返回结构化 JSON（供 FFI / 程序化调用使用）
+    ///
+    /// 格式：`{"results":[{"type":"select","columns":[...],"rows":[["v1","v2"]]}, ...]}`
+    ///
+    /// 说明：当前执行器在投影层把值格式化为字符串，所以 JSON 里行值统一为字符串
+    /// （VECTOR 保持 `[1,2,3]` 形式）。类型化行值属于后续协议升级，不在本次范围。
+    pub fn execute_json(&mut self, sql: &str) -> Result<String, String> {
+        let stmts = parse_sql(sql)?;
+        let results = self.executor.execute(stmts)?;
+        let mut out = String::from("{\"results\":[");
+        for (i, result) in results.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&execute_result_to_json(result));
+        }
+        out.push_str("]}");
+        Ok(out)
+    }
+}
+
+/// 将执行结果序列化为 JSON（零外部依赖，手写转义）
+fn execute_result_to_json(result: &executor::ExecuteResult) -> String {
+    use executor::ExecuteResult as R;
+    match result {
+        R::TableCreated { name } => {
+            format!("{{\"type\":\"table_created\",\"name\":\"{}\"}}", json_escape(name))
+        }
+        R::TableDropped { name } => {
+            format!("{{\"type\":\"table_dropped\",\"name\":\"{}\"}}", json_escape(name))
+        }
+        R::Inserted { row_id } => {
+            format!("{{\"type\":\"inserted\",\"row_id\":{}}}", row_id)
+        }
+        R::Deleted { count } => {
+            format!("{{\"type\":\"deleted\",\"count\":{}}}", count)
+        }
+        R::Updated { count } => {
+            format!("{{\"type\":\"updated\",\"count\":{}}}", count)
+        }
+        R::SelectResult { columns, rows } => {
+            let cols = columns.iter()
+                .map(|c| format!("\"{}\"", json_escape(c)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let rows_json = rows.iter()
+                .map(|row| {
+                    let vals = row.iter()
+                        .map(|v| format!("\"{}\"", json_escape(v)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("[{}]", vals)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"type\":\"select\",\"columns\":[{}],\"rows\":[{}]}}", cols, rows_json)
+        }
+        R::Message(text) => {
+            format!("{{\"type\":\"message\",\"text\":\"{}\"}}", json_escape(text))
+        }
+    }
+}
+
+/// JSON 字符串转义（RFC 8259 必需转义 + 控制字符）
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1252,5 +1331,54 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}.tmp", p));
             let _ = std::fs::remove_file(format!("{}.wal", p));
         }
+    }
+
+    // ===== 结构化 JSON 结果 =====
+
+    #[test]
+    fn test_execute_json_select() {
+        let mut db = ProbeDB::new();
+        db.execute("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'hello')").unwrap();
+
+        let json = db.execute_json("SELECT id, name FROM t").unwrap();
+        assert_eq!(
+            json,
+            "{\"results\":[{\"type\":\"select\",\"columns\":[\"id\",\"name\"],\"rows\":[[\"1\",\"hello\"]]}]}"
+        );
+    }
+
+    #[test]
+    fn test_execute_json_multiple_statements_and_escapes() {
+        let mut db = ProbeDB::new();
+        db.execute("CREATE TABLE t (id INTEGER, note TEXT)").unwrap();
+        // 文本里带双引号和反斜杠，验证 JSON 转义
+        db.execute("INSERT INTO t (id, note) VALUES (1, 'a\"b\\c')").unwrap();
+
+        let json = db.execute_json("SELECT note FROM t").unwrap();
+        assert!(
+            json.contains("a\\\"b\\\\c"),
+            "应正确转义引号和反斜杠，实际: {}",
+            json
+        );
+
+        // 多语句 → results 数组
+        let json2 = db.execute_json("INSERT INTO t (id, note) VALUES (2, 'x'); SELECT id FROM t").unwrap();
+        assert!(json2.contains("\"type\":\"inserted\""), "{}", json2);
+        assert!(json2.contains("\"type\":\"select\""), "{}", json2);
+    }
+
+    #[test]
+    fn test_json_escape_control_chars() {
+        assert_eq!(json_escape("a\nb\tc\rd"), "a\\nb\\tc\\rd");
+        assert_eq!(json_escape("\u{1}"), "\\u0001");
+        assert_eq!(json_escape("引号\"反斜杠\\"), "引号\\\"反斜杠\\\\");
+    }
+
+    #[test]
+    fn test_execute_json_error_returns_err() {
+        let mut db = ProbeDB::new();
+        let err = db.execute_json("SELECT * FROM ghost").unwrap_err();
+        assert!(err.contains("ghost"), "{}", err);
     }
 }

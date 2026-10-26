@@ -62,12 +62,11 @@ pub extern "C" fn probedb_open(path: *const c_char) -> *mut ProbeDBHandle {
     }
 }
 
-/// 执行 SQL，成功返回结果文本（Rust 侧分配，用 probedb_free_string 释放）；
-/// 失败返回 NULL（错误见 probedb_last_error）。
-#[no_mangle]
-pub extern "C" fn probedb_execute(
+/// 执行 SQL 的公共实现：NULL 防护 + panic 捕获 + Rust 分配字符串所有权
+fn run_execute(
     handle: *mut ProbeDBHandle,
     sql: *const c_char,
+    as_json: bool,
 ) -> *mut c_char {
     if handle.is_null() {
         set_last_error("null handle");
@@ -80,7 +79,13 @@ pub extern "C" fn probedb_execute(
     let h = unsafe { &mut *handle };
     let sql_str = unsafe { CStr::from_ptr(sql) }.to_string_lossy().into_owned();
 
-    let result = catch_unwind(AssertUnwindSafe(|| h.db.execute(&sql_str)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if as_json {
+            h.db.execute_json(&sql_str)
+        } else {
+            h.db.execute(&sql_str)
+        }
+    }));
     match result {
         Ok(Ok(out)) => match CString::new(out) {
             Ok(c) => c.into_raw(),
@@ -94,10 +99,37 @@ pub extern "C" fn probedb_execute(
             ptr::null_mut()
         }
         Err(_) => {
-            set_last_error("panic in probedb_execute");
+            set_last_error(if as_json {
+                "panic in probedb_execute_json"
+            } else {
+                "panic in probedb_execute"
+            });
             ptr::null_mut()
         }
     }
+}
+
+/// 执行 SQL，成功返回结果文本（Rust 侧分配，用 probedb_free_string 释放）；
+/// 失败返回 NULL（错误见 probedb_last_error）。
+#[no_mangle]
+pub extern "C" fn probedb_execute(
+    handle: *mut ProbeDBHandle,
+    sql: *const c_char,
+) -> *mut c_char {
+    run_execute(handle, sql, false)
+}
+
+/// 执行 SQL，成功返回结构化 JSON（Rust 侧分配，用 probedb_free_string 释放）；
+/// 失败返回 NULL（错误见 probedb_last_error）。
+///
+/// JSON 格式：`{"results":[{"type":"select","columns":[...],"rows":[["..."]]}]}`
+/// 行值当前统一为字符串（执行器投影层已格式化）。
+#[no_mangle]
+pub extern "C" fn probedb_execute_json(
+    handle: *mut ProbeDBHandle,
+    sql: *const c_char,
+) -> *mut c_char {
+    run_execute(handle, sql, true)
 }
 
 /// 将当前状态原子保存到磁盘（先 flush WAL 再写快照）。
@@ -284,5 +316,32 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.wal", path.display()));
+    }
+
+    #[test]
+    fn test_ffi_execute_json() {
+        let db = probedb_open(ptr::null());
+        assert!(!db.is_null());
+
+        let s = c("CREATE TABLE t (id INTEGER, name TEXT)");
+        let out = cstr_to_string(probedb_execute_json(db, s.as_ptr()));
+        assert!(out.contains("\"type\":\"table_created\""), "{}", out);
+
+        let s = c("INSERT INTO t (id, name) VALUES (1, 'alice')");
+        let out = cstr_to_string(probedb_execute_json(db, s.as_ptr()));
+        assert!(out.contains("\"type\":\"inserted\""), "{}", out);
+
+        let s = c("SELECT id, name FROM t");
+        let out = cstr_to_string(probedb_execute_json(db, s.as_ptr()));
+        assert!(out.contains("\"columns\":[\"id\",\"name\"]"), "{}", out);
+        assert!(out.contains("\"rows\":[[\"1\",\"alice\"]]"), "{}", out);
+
+        // 错误仍走 NULL + last_error
+        let s = c("SELECT * FROM ghost");
+        let r = probedb_execute_json(db, s.as_ptr());
+        assert!(r.is_null());
+        assert!(cstr_to_string(probedb_last_error()).contains("ghost"));
+
+        probedb_close(db);
     }
 }

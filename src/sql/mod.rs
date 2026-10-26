@@ -64,18 +64,49 @@ pub fn parse_sql(sql: &str) -> Result<Vec<SQLStatement>, String> {
         return Err("SQL语句为空".to_string());
     }
 
-    // 按行处理多条语句（简单分割）
-    let statements: Vec<&str> = if trimmed.contains(';') {
-        trimmed.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
-    } else {
-        vec![trimmed]
-    };
+    // 按分号拆分多条语句（引号内的分号不算分隔符，'' 为转义引号）
+    let statements = split_sql_statements(trimmed);
 
     let mut result = Vec::new();
     for stmt in statements {
-        result.push(parse_one(stmt)?);
+        result.push(parse_one(&stmt)?);
     }
     Ok(result)
+}
+
+/// 按分号拆分语句，跳过单引号字符串内部；支持 SQL 标准 `''` 转义。
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2; // 转义引号，仍在字符串内
+                    continue;
+                }
+                in_quote = !in_quote;
+                i += 1;
+            }
+            b';' if !in_quote => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt.to_string());
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
 }
 
 fn parse_one(sql: &str) -> Result<SQLStatement, String> {
@@ -211,15 +242,19 @@ fn parse_insert(sql: &str) -> Result<SQLStatement, String> {
     // 提取表名
     let (table_name, rest) = split_first_word(rest)?;
 
-    // 提取列名（括号内）
+    // 提取列名（括号内）。省略列清单时（INSERT INTO t VALUES ...）按表结构顺序全列插入。
     let rest = rest.trim();
-    if !rest.starts_with('(') {
-        return Err("缺少列名括号".to_string());
-    }
-    let (cols_str, values_part) = split_parenthesized(rest)?;
-    let columns: Vec<String> = cols_str.split(',')
-        .map(|s| s.trim().trim_matches('`').to_lowercase())
-        .collect();
+    let (columns, values_part) = if rest.to_uppercase().starts_with("VALUES") {
+        (Vec::new(), rest.to_string())
+    } else if rest.starts_with('(') {
+        let (cols_str, values_part) = split_parenthesized(rest)?;
+        let columns: Vec<String> = cols_str.split(',')
+            .map(|s| s.trim().trim_matches('`').to_lowercase())
+            .collect();
+        (columns, values_part)
+    } else {
+        return Err("缺少列名括号或VALUES子句".to_string());
+    };
 
     // 提取 VALUES 部分
     let values_part_str = values_part.trim().to_string();
@@ -667,12 +702,27 @@ fn split_parenthesized(s: &str) -> Result<(String, String), String> {
     let content_start = 1;
     let mut content_end = 0;
     let mut found = false;
+    // 字符串内部的括号不参与配对（如 VALUES ('a ( b')）
+    let mut in_quote = false;
 
-    for (i, c) in s[1..].char_indices() {
+    let mut iter = s[1..].char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if in_quote {
+            if c == '\'' {
+                // '' 为转义引号：跳过第二个，字符串继续
+                if let Some(&(_, '\'')) = iter.peek() {
+                    iter.next();
+                    continue;
+                }
+                in_quote = false;
+            }
+            continue;
+        }
         match c {
+            '\'' => in_quote = true,
             '(' => depth += 1,
             ')' if depth > 0 => depth -= 1,
-            ')' if depth == 0 => {
+            ')' => {
                 content_end = i + 1;
                 found = true;
                 break;
@@ -700,27 +750,40 @@ fn parse_parenthesized_list(s: &str) -> Result<(Vec<String>, String), String> {
 
     let (content, rest) = split_parenthesized(s)?;
 
-    // 分割逗号，注意引号内的逗号
+    // 分割逗号，注意引号内的逗号；'' 为转义引号，保留原文交给值解析层还原
     let mut values = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
 
-    for c in content.chars() {
-        match c {
-            '\'' if in_quote => {
-                current.push(c);
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quote {
+            current.push(c);
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    current.push(chars[i + 1]); // 保留 ''，由 unquote 还原为 '
+                    i += 2;
+                    continue;
+                }
                 in_quote = false;
             }
+            i += 1;
+            continue;
+        }
+        match c {
             '\'' => {
                 current.push(c);
                 in_quote = true;
             }
-            ',' if !in_quote => {
+            ',' => {
                 values.push(current.trim().to_string());
                 current = String::new();
             }
             _ => current.push(c),
         }
+        i += 1;
     }
     if !current.trim().is_empty() {
         values.push(current.trim().to_string());
@@ -916,6 +979,72 @@ mod tests {
                 assert_eq!(assignments[1].0, "age");
             }
             _ => panic!("Expected Update"),
+        }
+    }
+
+    // ===== SQL 字符串字面量健壮性（引号 / 分号 / 括号）=====
+
+    #[test]
+    fn test_split_statements_ignores_semicolon_in_string() {
+        let stmts = parse_sql(
+            "INSERT INTO t (id, note) VALUES (1, 'a;b'); SELECT id FROM t"
+        ).unwrap();
+        assert_eq!(stmts.len(), 2, "字符串里的分号不应拆句");
+        match &stmts[0] {
+            SQLStatement::Insert { values, .. } => {
+                assert_eq!(values[0][1], "'a;b'");
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_split_parenthesized_ignores_parens_in_string() {
+        // 字符串里的括号（含不配对）不影响括号配对
+        let stmts = parse_sql(
+            "INSERT INTO t (id, note) VALUES (1, 'a ( b ) c')"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Insert { values, .. } => {
+                assert_eq!(values[0][1], "'a ( b ) c'");
+            }
+            _ => panic!("Expected Insert"),
+        }
+
+        let stmts = parse_sql(
+            "INSERT INTO t (id, note) VALUES (1, 'unbalanced ( here')"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Insert { values, .. } => {
+                assert_eq!(values[0][1], "'unbalanced ( here'");
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_without_column_list() {
+        let stmts = parse_sql("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        match &stmts[0] {
+            SQLStatement::Insert { columns, values, .. } => {
+                assert!(columns.is_empty(), "省略列清单时 columns 应为空");
+                assert_eq!(values[0], vec!["1".to_string(), "'alice'".to_string()]);
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_escaped_quote_kept_for_unquote() {
+        // 解析层保留 '' 原样，由存储层 unquote 还原为单个 '
+        let stmts = parse_sql(
+            "INSERT INTO t (id, note) VALUES (1, 'It''s ok')"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Insert { values, .. } => {
+                assert_eq!(values[0][1], "'It''s ok'");
+            }
+            _ => panic!("Expected Insert"),
         }
     }
 }

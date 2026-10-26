@@ -82,21 +82,58 @@ impl Executor {
                 Ok(ExecuteResult::TableDropped { name: table_name })
             }
 
-            SQLStatement::Insert { table_name, columns: _, values } => {
+            SQLStatement::Insert { table_name, columns, values } => {
                 let schema = self.engine.get_schema(&table_name)?;
                 let col_types: Vec<_> = schema.columns.iter().map(|c| c.data_type.clone()).collect();
                 let col_names: Vec<_> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows_parsed: Result<Vec<Vec<_>>, String> = values.iter().map(|row_values| {
-                    let mut parsed = Vec::new();
-                    for (i, val_str) in row_values.iter().enumerate() {
-                        if i >= col_types.len() { break; }
-                        let clean = val_str.trim_matches('\'');
-                        // 保留底层解析原因（格式错误/日期越界/类型不符），否则用户只看到"无法解析"
-                        let value = parse_value(clean, &col_types[i])
-                            .map_err(|e| format!("无法解析列 '{}' 的值 '{}': {}", col_names[i], clean, e))?;
-                        parsed.push(value);
+
+                // 目标列映射：显式列清单 → schema 下标（允许任意顺序）；
+                // 省略列清单 → 按表结构顺序全列插入。
+                // 之前这里忽略了 columns，导致 `INSERT INTO t (b, a) VALUES ...`
+                // 按位置静默写错列——已修复为按列名映射。
+                let target_indices: Vec<usize> = if columns.is_empty() {
+                    (0..col_names.len()).collect()
+                } else {
+                    let mut idxs = Vec::with_capacity(columns.len());
+                    for col in &columns {
+                        let pos = col_names.iter().position(|n| n == col)
+                            .ok_or_else(|| format!(
+                                "列 '{}' 不存在于表 '{}'（可选列: {}）",
+                                col, table_name, col_names.join(", ")
+                            ))?;
+                        if idxs.contains(&pos) {
+                            return Err(format!("列 '{}' 在 INSERT 列清单中重复", col));
+                        }
+                        idxs.push(pos);
                     }
-                    Ok(parsed)
+                    // 行是定长的（无 NULL/DEFAULT 概念），部分列插入没有安全的默认值，
+                    // 明确报错优于用零值填空导致数据静默失真。
+                    if idxs.len() != col_names.len() {
+                        return Err(format!(
+                            "暂不支持部分列插入：表 '{}' 有 {} 列（{}），INSERT 只提供了 {} 列",
+                            table_name, col_names.len(), col_names.join(", "), idxs.len()
+                        ));
+                    }
+                    idxs
+                };
+
+                let rows_parsed: Result<Vec<Vec<Value>>, String> = values.iter().map(|row_values| {
+                    if row_values.len() != target_indices.len() {
+                        return Err(format!(
+                            "列数不匹配：表 '{}' 需要 {} 个值，本行提供了 {} 个",
+                            table_name, target_indices.len(), row_values.len()
+                        ));
+                    }
+                    // 先按 schema 顺序占坑，再按列清单写入，保证最终行序永远与表结构一致
+                    let mut parsed: Vec<Option<Value>> = (0..col_names.len()).map(|_| None).collect();
+                    for (val_str, &schema_idx) in row_values.iter().zip(target_indices.iter()) {
+                        let shown = crate::storage::unquote_sql_literal(val_str);
+                        // 保留底层解析原因（格式错误/日期越界/类型不符），否则用户只看到"无法解析"
+                        let value = parse_value(val_str, &col_types[schema_idx])
+                            .map_err(|e| format!("无法解析列 '{}' 的值 '{}': {}", col_names[schema_idx], shown, e))?;
+                        parsed[schema_idx] = Some(value);
+                    }
+                    Ok(parsed.into_iter().map(|v| v.expect("全列已填充")).collect())
                 }).collect();
                 let all_parsed = rows_parsed?;
                 let count = all_parsed.len();
@@ -3583,5 +3620,115 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("排序列"), "错误信息应包含'排序列'，实际: {}", err);
         assert!(err.contains("ghost"), "错误信息应包含列名，实际: {}", err);
+    }
+
+    // ===== INSERT 列清单语义（按列名映射 / 省略列清单 / 错误处理）=====
+
+    #[test]
+    fn test_insert_columns_reordered_maps_by_name() {
+        // 回归：以前忽略列清单，`(b, a)` 会按位置静默写错列
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (a TEXT, b TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (b, a) VALUES ('x', 'y')").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT a, b FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "y", "a 列应拿到列清单里 a 对应的值");
+                assert_eq!(rows[0][1], "x", "b 列应拿到列清单里 b 对应的值");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_insert_without_column_list_uses_schema_order() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t VALUES (1, 'alice')").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT id, name FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "1");
+                assert_eq!(rows[0][1], "alice");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_insert_unknown_column_errors() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        let err = executor.execute(parse_sql(
+            "INSERT INTO t (id, ghost) VALUES (1, 'x')"
+        ).unwrap()).unwrap_err();
+        assert!(err.contains("ghost"), "应指出不存在的列名，实际: {}", err);
+    }
+
+    #[test]
+    fn test_insert_duplicate_column_errors() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        let err = executor.execute(parse_sql(
+            "INSERT INTO t (id, id) VALUES (1, 2)"
+        ).unwrap()).unwrap_err();
+        assert!(err.contains("重复"), "应指出重复列，实际: {}", err);
+    }
+
+    #[test]
+    fn test_insert_partial_columns_errors() {
+        // 没有 NULL/DEFAULT 概念时，部分列插入必须明确报错而不是补零
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
+        let err = executor.execute(parse_sql(
+            "INSERT INTO t (id, name) VALUES (1, 'alice')"
+        ).unwrap()).unwrap_err();
+        assert!(err.contains("部分列"), "应提示不支持部分列插入，实际: {}", err);
+    }
+
+    #[test]
+    fn test_insert_value_count_mismatch_errors() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT)").unwrap()).unwrap();
+        let err = executor.execute(parse_sql(
+            "INSERT INTO t (id, name) VALUES (1)"
+        ).unwrap()).unwrap_err();
+        assert!(err.contains("列数不匹配"), "应提示列数不匹配，实际: {}", err);
+    }
+
+    #[test]
+    fn test_insert_sql_literal_special_chars_roundtrip() {
+        // 记忆类文本的真实字符：单引号（''转义）、分号、括号、管道、反斜杠、换行
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, note TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "INSERT INTO t (id, note) VALUES (1, 'It''s a (test); with | pipe \\ and newline\nend')"
+        ).unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT note FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "It's a (test); with | pipe \\ and newline\nend");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_update_text_with_quotes() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, note TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, note) VALUES (1, 'old')").unwrap()).unwrap();
+        executor.execute(parse_sql("UPDATE t SET note = 'It''s new' WHERE id = 1").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT note FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "It's new");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
     }
 }

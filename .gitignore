@@ -1,2 +1,13 @@
 /target
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ProbeDB 运行期数据
+*.pdb
+*.pdb.wal
+*.pdb.lock
+*.pdb.tmp

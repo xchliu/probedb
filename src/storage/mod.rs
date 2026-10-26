@@ -491,42 +491,50 @@ fn type_matches(col_type: &DataType, value: &Value) -> bool {
     }
 }
 
+/// 去掉 SQL 字符串字面量外层单引号，并把成对的 `''` 还原为单个 `'`。
+///
+/// 非字符串字面量（如 `42`、`[1,2]`）原样返回（仅 trim 两端空白）。
+pub fn unquote_sql_literal(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        t[1..t.len() - 1].replace("''", "'")
+    } else {
+        t.to_string()
+    }
+}
+
 /// 将字符串值解析为对应的 Value
 pub fn parse_value(value_str: &str, col_type: &DataType) -> Result<Value, String> {
+    let clean = unquote_sql_literal(value_str);
     match col_type {
         DataType::Integer => {
-            let v = value_str.parse::<i64>()
-                .map_err(|_| format!("无法解析为整数: {}", value_str))?;
+            let v = clean.parse::<i64>()
+                .map_err(|_| format!("无法解析为整数: {}", clean))?;
             Ok(Value::Integer(v))
         }
         DataType::Float => {
-            let v = value_str.parse::<f64>()
-                .map_err(|_| format!("无法解析为浮点数: {}", value_str))?;
+            let v = clean.parse::<f64>()
+                .map_err(|_| format!("无法解析为浮点数: {}", clean))?;
             Ok(Value::Float(v))
         }
-        DataType::Text => {
-            // 去掉可能的引号
-            let s = value_str.trim_matches('\'');
-            Ok(Value::Text(s.to_string()))
-        }
+        DataType::Text => Ok(Value::Text(clean)),
         DataType::Boolean => {
             // 接受 true/false（大小写不敏感）与 1/0 两种写法
-            let s = value_str.trim().trim_matches('\'');
-            match s.to_lowercase().as_str() {
+            match clean.trim().to_lowercase().as_str() {
                 "true" | "1" => Ok(Value::Boolean(true)),
                 "false" | "0" => Ok(Value::Boolean(false)),
-                _ => Err(format!("无法解析为布尔值(true/false): {}", value_str)),
+                _ => Err(format!("无法解析为布尔值(true/false): {}", clean)),
             }
         }
-        DataType::Date => crate::types::normalize_date(value_str).map(Value::Date),
-        DataType::Time => crate::types::normalize_time(value_str).map(Value::Time),
+        DataType::Date => crate::types::normalize_date(&clean).map(Value::Date),
+        DataType::Time => crate::types::normalize_time(&clean).map(Value::Time),
         DataType::Vector(_) => {
             // 解析向量格式: [1.0,2.0,3.0] 或 1.0,2.0,3.0
-            let trimmed = value_str.trim_matches('[').trim_matches(']');
+            let trimmed = clean.trim_matches('[').trim_matches(']');
             let nums: Result<Vec<f64>, _> = trimmed.split(',')
                 .map(|s| s.trim().parse::<f64>())
                 .collect();
-            let v = nums.map_err(|_| format!("无法解析为向量: {}", value_str))?;
+            let v = nums.map_err(|_| format!("无法解析为向量: {}", clean))?;
             Ok(Value::Vector(v))
         }
     }

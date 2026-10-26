@@ -4,6 +4,56 @@
 
 ---
 
+## 2026-10-26（项目交接 — 停止等待，启动 Hermes 真实接入）
+
+### 背景
+- 坦哥将项目交给新的开发 Agent 接手。此前 9/1 起两项"待确认"被当作阻塞挂了 56 天，
+  但 10/16 日志其实已自行拍板方案 A（先做独立 Python 工具）。
+- **本次决策**：不再等待确认，按方案 A 推进；零依赖铁律继续坚持；Python 绑定收敛为唯一实现。
+  （坦哥如要调整，随时可推翻。）
+
+### 完成
+- **修复 INSERT 列清单被忽略（静默写错数据）**：执行器原来 `columns: _`，按位置解析。
+  现在按列名映射到 schema 下标，允许任意列顺序；省略列清单时按表结构全列插入；
+  不存在列/重复列/列数不匹配/部分列插入均明确报错（部分列无 NULL/DEFAULT，不补零）。
+- **SQL 字符串字面量健壮性**（记忆文本必备）：
+  - 语句拆分改为引号感知：字符串内的 `;` 不再被当作分隔符
+  - 括号配对忽略字符串内部：`'a ( b'` 这类文本不再破坏 `VALUES (...)`
+  - 支持 SQL 标准 `''` 转义；`unquote_sql_literal()` 统一还原（INSERT/UPDATE 共用）
+- **新增结构化结果协议**：
+  - Rust：`ProbeDB::execute_json()` → `{"results":[{...}]}`
+  - C ABI：新增 `probedb_execute_json()`（与 `probedb_execute` 共享 NULL/panic 防护）
+  - 手写 JSON 转义（零依赖），覆盖引号/反斜杠/控制字符/中文
+- **Python 绑定收敛**：重写 `python/probedb.py` 为唯一实现，删除重复的 `bridge/probedb.py`
+  - `ProbeDB.open(path=None)`、结构化 `Result`（columns/rows/row_id/count）、`execute_all`
+  - 支持 `PROBEDB_LIB` 环境变量指定动态库；同一句柄加 Lock（ctypes 调 C 会释放 GIL）
+  - 修掉旧文档 `ProbeDB()` 与构造器不一致、`__del__` 在构造失败时抛 AttributeError
+- **Hermes 记忆独立工具 `tools/probedb_mem.py`**（方案 A 第一版）：
+  - `import` 解析 `§` 分隔条目、提取 `[tag]`、写 ProbeDB 后 persist
+  - `search`（标签命中优先 + 内容命中次数）、`list`、`add`、`stats`
+  - 文件锁（fcntl）串行化多个 CLI 进程；默认库 `~/.probedb/hermes_memory.pdb`
+- **工程收口**：新增 README（能力/结构/限制/路线图）、.gitignore（Python/运行期数据）、
+  Python 可重复测试 `python/test_probedb.py`（10 个用例）。
+
+### 测试
+- **Rust：213 passed, 0 failed**（196 → 213，+17：INSERT 列语义 6、JSON 结果 4、
+  FFI JSON 1、SQL 字面量解析 5、UPDATE 引号 1）
+- **Python：10 passed**（绑定 CRUD/列重排/错误/持久化 + 记忆工具解析/导入/检索/追加/跨进程恢复）
+- release 构建通过（仍有 11 条 dead_code 警告，属历史遗留，后续清理）
+
+### 端到端验证（真实数据）
+- 导入 `~/.hermes/memories/MEMORY.md` + `USER.md` → **46 条**（MEMORY 30 / USER 16，41 个标签）
+- 每次命令都是新进程：导入进程写盘 → stats/search 进程重新 load → 数据完整
+- `search "ProbeDB"` 正确命中真实记忆条目
+- 验证库：`target/hermes_memory.pdb`（gitignored）
+
+### 下一步
+1. 把记忆工具挂到 Hermes（CLI/JSON 调用），先只做"读"，观察真实使用
+2. 协议升级：类型化行值 + 参数绑定（去掉 SQL 字符串拼接）
+3. 再评估是否替换 hermes-agent 内部存储（当前不建议）
+
+---
+
 ## 2026-10-23（周五：第9周结束 — 无新任务，阻塞第53天）
 
 ### 状态
