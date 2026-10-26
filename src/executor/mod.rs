@@ -3731,4 +3731,24 @@ mod tests {
             _ => panic!("Expected SelectResult"),
         }
     }
+
+    #[test]
+    fn test_update_text_with_comma_roundtrip() {
+        // 记忆文本常带逗号；UPDATE 赋值不能按逗号误切
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, note TEXT, name TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, note, name) VALUES (1, 'old', 'old')").unwrap()).unwrap();
+        executor.execute(parse_sql(
+            "UPDATE t SET note = 'a, b, c', name = 'x' WHERE id = 1"
+        ).unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT note, name FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => {
+                assert_eq!(rows[0][0], "a, b, c");
+                assert_eq!(rows[0][1], "x");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
 }

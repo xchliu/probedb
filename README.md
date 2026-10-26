@@ -9,8 +9,9 @@ AI 原生嵌入式数据库。Rust 实现，**零外部依赖**（没有任何�
 | 项目 | 状态 |
 |---|---|
 | Rust 核心 | 约 8.6k 行，零第三方依赖 |
-| 测试 | **213 个 Rust 测试 + 10 个 Python 测试，全绿** |
+| 测试 | **216 个 Rust 测试 + 14 个 Python 测试，全绿** |
 | Hermes 接入验证 | ✅ 已导入真实 `~/.hermes/memories`（46 条）并完成跨进程检索 |
+| 候选评估 | [docs/hermes-integration.md](docs/hermes-integration.md)：小对象记忆候选成立，大存储不适用 |
 | 版本 | v0.1.0（嵌入式，单进程） |
 
 ## 快速开始
@@ -30,7 +31,13 @@ python3 -m unittest discover -s python -v
 python3 tools/probedb_mem.py import --db ~/.probedb/hermes_memory.pdb
 python3 tools/probedb_mem.py stats  --db ~/.probedb/hermes_memory.pdb
 python3 tools/probedb_mem.py search "ProbeDB" --db ~/.probedb/hermes_memory.pdb
+python3 tools/probedb_mem.py get 4   --db ~/.probedb/hermes_memory.pdb
 python3 tools/probedb_mem.py add "一条新记忆" --tag 测试 --db ~/.probedb/hermes_memory.pdb
+python3 tools/probedb_mem.py update 47 --content "修正后的内容" --db ~/.probedb/hermes_memory.pdb
+python3 tools/probedb_mem.py delete 47 --yes --db ~/.probedb/hermes_memory.pdb
+
+# 5. 基准测试（100/1k/5k/10k 条）
+python3 tools/bench_probedb.py --sizes 100,1000,5000,10000
 ```
 
 `tools/probedb_mem.py` 用文件锁串行化多个 CLI 进程，导入/写入后自动 `persist()`，
@@ -60,7 +67,10 @@ python/
   probedb.py        # 唯一的 Python 绑定（ctypes，结构化 Result）
   test_probedb.py   # Python 单元测试
 tools/
-  probedb_mem.py    # Hermes 记忆独立存储工具（导入/检索/统计/追加）
+  probedb_mem.py    # Hermes 记忆独立存储工具（导入/检索/增删改/统计）
+  bench_probedb.py  # 记忆场景基准测试（导入/检索/CLI 延迟）
+docs/
+  hermes-integration.md  # 候选评估：实测数据、接入方案、风险
 ```
 
 ## 当前限制（明确边界）

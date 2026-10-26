@@ -14,10 +14,13 @@ CLI/JSON 调用即可接入。
     python3 tools/probedb_mem.py search "ProbeDB"
     python3 tools/probedb_mem.py search "模型偏好" --json
 
-    # 查看 / 统计 / 追加
+    # 查看 / 统计 / 追加 / 更新 / 删除
     python3 tools/probedb_mem.py list --limit 20
+    python3 tools/probedb_mem.py get 4
     python3 tools/probedb_mem.py stats
     python3 tools/probedb_mem.py add "新记忆内容" --tag 项目 --source manual
+    python3 tools/probedb_mem.py update 4 --content "修正后的内容" --tag 新标签
+    python3 tools/probedb_mem.py delete 4 --yes
 
 数据库默认在 ``~/.probedb/hermes_memory.pdb``（可用 --db 或环境变量
 PROBEDB_MEMORY_DB 覆盖）。
@@ -241,6 +244,51 @@ def add_entry(db: ProbeDB, text: str, tags: str = "", source: str = "manual") ->
     return entry_id
 
 
+def get_entry(db: ProbeDB, entry_id: int) -> Optional[dict[str, Any]]:
+    """按 id 取单条记忆，不存在返回 None。"""
+    target = int(entry_id)
+    for entry in fetch_all(db):
+        if entry["id"] == target:
+            return entry
+    return None
+
+
+def update_entry(
+    db: ProbeDB,
+    entry_id: int,
+    content: Optional[str] = None,
+    tags: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+    """更新一条记忆的 content/tags/source（未提供的字段保持不变）。"""
+    entry = get_entry(db, entry_id)
+    if entry is None:
+        return False
+    new_content = entry["content"] if content is None else content
+    new_tags = entry["tags"] if tags is None else tags
+    new_source = entry["source"] if source is None else source
+    # SQL 字面量已做 '' 转义，值里的逗号/引号不会破坏 UPDATE 解析
+    db.execute(
+        "UPDATE memories SET "
+        f"content = {sql_literal(new_content)}, "
+        f"tags = {sql_literal(new_tags)}, "
+        f"source = {sql_literal(new_source)} "
+        f"WHERE id = {int(entry_id)}"
+    )
+    db.persist()
+    return True
+
+
+def delete_entry(db: ProbeDB, entry_id: int) -> bool:
+    """删除一条记忆，返回是否删除了行。"""
+    ensure_schema(db)
+    result = db.execute(f"DELETE FROM memories WHERE id = {int(entry_id)}")
+    deleted = result.count or 0
+    if deleted:
+        db.persist()
+    return deleted > 0
+
+
 def stats(db: ProbeDB) -> dict[str, Any]:
     ensure_schema(db)
     entries = fetch_all(db)
@@ -340,6 +388,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--tag", default="")
     p_add.add_argument("--source", default="manual")
 
+    p_get = sub.add_parser("get", parents=[common], help="按 id 查看记忆")
+    p_get.add_argument("id", type=int)
+    p_get.add_argument("--json", action="store_true")
+
+    p_update = sub.add_parser("update", parents=[common], help="更新一条记忆")
+    p_update.add_argument("id", type=int)
+    p_update.add_argument("--content")
+    p_update.add_argument("--tag")
+    p_update.add_argument("--source")
+
+    p_delete = sub.add_parser("delete", parents=[common], help="删除一条记忆")
+    p_delete.add_argument("id", type=int)
+    p_delete.add_argument("--yes", action="store_true", help="跳过交互确认")
+
     p_stats = sub.add_parser("stats", parents=[common], help="统计信息")
     p_stats.add_argument("--json", action="store_true")
 
@@ -380,6 +442,50 @@ def main(argv: Optional[list[str]] = None) -> int:
         with locked_db(db_path) as db:
             entry_id = add_entry(db, args.text, tags=args.tag, source=args.source)
         print(f"✅ 已写入记忆 id={entry_id} → {db_path}")
+        return 0
+
+    if args.command == "get":
+        with locked_db(db_path) as db:
+            entry = get_entry(db, args.id)
+        if entry is None:
+            print(f"❌ 记忆 id={args.id} 不存在", file=sys.stderr)
+            return 1
+        if args.json:
+            _print_json(entry)
+        else:
+            _print_entries([entry])
+        return 0
+
+    if args.command == "update":
+        if args.content is None and args.tag is None and args.source is None:
+            print("❌ update 至少需要 --content / --tag / --source 之一", file=sys.stderr)
+            return 2
+        with locked_db(db_path) as db:
+            updated = update_entry(
+                db, args.id, content=args.content, tags=args.tag, source=args.source
+            )
+        if not updated:
+            print(f"❌ 记忆 id={args.id} 不存在", file=sys.stderr)
+            return 1
+        print(f"✅ 已更新记忆 id={args.id} → {db_path}")
+        return 0
+
+    if args.command == "delete":
+        with locked_db(db_path) as db:
+            entry = get_entry(db, args.id)
+            if entry is None:
+                print(f"❌ 记忆 id={args.id} 不存在", file=sys.stderr)
+                return 1
+            if not args.yes:
+                answer = input(f"确认删除 id={args.id}「{entry['content'][:40]}」? [y/N] ")
+                if answer.strip().lower() not in ("y", "yes"):
+                    print("已取消")
+                    return 1
+            deleted = delete_entry(db, args.id)
+        if not deleted:
+            print(f"❌ 删除失败：id={args.id}", file=sys.stderr)
+            return 1
+        print(f"✅ 已删除记忆 id={args.id} → {db_path}")
         return 0
 
     if args.command == "stats":

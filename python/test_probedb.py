@@ -21,12 +21,15 @@ from probedb import ProbeDB, ProbeDBError  # noqa: E402
 
 from tools.probedb_mem import (  # noqa: E402
     add_entry,
+    delete_entry,
     ensure_schema,
+    get_entry,
     import_files,
     list_entries,
     parse_memory_text,
     search,
     stats,
+    update_entry,
 )
 
 
@@ -159,6 +162,35 @@ class MemoryToolTests(unittest.TestCase):
         ensure_schema(self.db)
         add_entry(self.db, "hello world")
         self.assertEqual(search(self.db, "nonexistent-xyz"), [])
+
+    def test_update_entry_with_commas_and_quotes(self):
+        entry_id = add_entry(self.db, "old", tags="t1")
+        ok = update_entry(self.db, entry_id, content="a, b; It's ok", tags="t2")
+        self.assertTrue(ok)
+
+        entry = get_entry(self.db, entry_id)
+        self.assertEqual(entry["content"], "a, b; It's ok")
+        self.assertEqual(entry["tags"], "t2")
+        self.assertEqual(entry["source"], "manual")
+
+    def test_update_missing_entry_returns_false(self):
+        self.assertFalse(update_entry(self.db, 999, content="x"))
+        self.assertIsNone(get_entry(self.db, 999))
+
+    def test_delete_entry(self):
+        entry_id = add_entry(self.db, "to delete")
+        self.assertTrue(delete_entry(self.db, entry_id))
+        self.assertIsNone(get_entry(self.db, entry_id))
+        self.assertFalse(delete_entry(self.db, entry_id))
+
+    def test_delete_persists_across_reopen(self):
+        entry_id = add_entry(self.db, "delete me")
+        delete_entry(self.db, entry_id)
+        self.db.close()
+
+        self.db = ProbeDB.open(str(self.db_path))
+        self.assertIsNone(get_entry(self.db, entry_id))
+        self.assertEqual(stats(self.db)["total"], 0)
 
 
 if __name__ == "__main__":

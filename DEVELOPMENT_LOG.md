@@ -47,10 +47,41 @@
 - `search "ProbeDB"` 正确命中真实记忆条目
 - 验证库：`target/hermes_memory.pdb`（gitignored）
 
+### 第二轮（同日）：记忆生命周期补全 + 规模验证
+
+#### 完成
+- **修复 UPDATE 赋值解析**：值里的逗号不再被当成赋值分隔符（`SET note = 'a, b, c'`）；
+  字符串里的 `" WHERE "` 不再被误判为子句边界；DELETE 的 WHERE 定位同样改为引号感知。
+  新增 `find_keyword_outside_quotes()` / `split_outside_quotes()` 两个零依赖辅助函数。
+- **记忆工具补齐生命周期**：`get <id>`、`update <id> --content/--tag/--source`、`delete <id> [--yes]`。
+  update 先取原记录再合并未提供字段，避免部分更新把其它字段置空。
+- **新增 `tools/bench_probedb.py`**：可复现的规模基准（导入/落盘/重开/检索/CLI 延迟）。
+- **新增 [docs/hermes-integration.md](docs/hermes-integration.md)**：候选评估 + 实测数据 +
+  三阶段接入方案（只读 → 双写 → 切换）+ 风险与回滚前置项。
+
+#### 规模实测（release，单机）
+| 条目 | 导入 | DB 体积 | 重开 | 检索 avg | CLI 单次 |
+|---:|---:|---:|---:|---:|---:|
+| 46（真实 Hermes） | — | 10.7 KB | 0.24 ms | 0.18 ms | 53.6 ms |
+| 1,000 | 0.015 s | 225.8 KB | 1.44 ms | 3.2 ms | 56.7 ms |
+| 10,000 | 0.150 s | 2.2 MB | 13.7 ms | 33.4 ms | 108.1 ms |
+
+- 10,000 条真实格式 md 经 CLI 导入：0.2 s；CLI 检索：100 ms（含进程启动）
+- 并发：8 个 CLI 进程同时 `add`，8 条全部落盘（fcntl 文件锁生效，无丢更新）
+
+#### 测试
+- **Rust：216 passed, 0 failed**（+3：UPDATE 逗号值、WHERE 关键字在字符串内、执行器逗号 roundtrip）
+- **Python：14 passed**（+4：get/update/delete/删除后重启校验）
+
+#### 结论
+- 46 条 / 10.7 KB 的真实记忆规模下：候选成立，可以进入只读试点。
+- 会话/state.db 等 GB 级数据：当前存储模型不适用，不做替换。
+- Phase 2 切换前必须补：`export`（可回滚）、增量同步/去重。
+
 ### 下一步
-1. 把记忆工具挂到 Hermes（CLI/JSON 调用），先只做"读"，观察真实使用
-2. 协议升级：类型化行值 + 参数绑定（去掉 SQL 字符串拼接）
-3. 再评估是否替换 hermes-agent 内部存储（当前不建议）
+1. Hermes 只读试点（需确认是否允许改 `~/.hermes`；不允许则提供仓库内适配层）
+2. 补 `export` + 增量同步，为双写阶段做准备
+3. 协议升级：类型化行值 + 参数绑定（去掉 SQL 字符串拼接）
 
 ---
 

@@ -566,6 +566,69 @@ fn parse_select(sql: &str) -> Result<SQLStatement, String> {
 
 /// 解析 DELETE 语句
 /// DELETE FROM table WHERE condition
+/// 在引号外查找关键字（大小写不敏感），返回字节起点。
+///
+/// 用于从 UPDATE 的赋值区里定位真正的 ` WHERE `——字符串里的
+/// "where" 不能被当成子句边界。
+fn find_keyword_outside_quotes(s: &str, keyword: &str) -> Option<usize> {
+    let mut in_quote = false;
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if in_quote {
+            if c == '\'' {
+                // '' 转义：跳过第二个，仍在字符串内
+                if let Some(&(_, '\'')) = iter.peek() {
+                    iter.next();
+                    continue;
+                }
+                in_quote = false;
+            }
+            continue;
+        }
+        if c == '\'' {
+            in_quote = true;
+            continue;
+        }
+        // get() 返回 None 表示 i+len 不在字符边界，直接跳过
+        if let Some(candidate) = s.get(i..i + keyword.len()) {
+            if candidate.eq_ignore_ascii_case(keyword) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// 在引号外按分隔符切分（支持 SQL 标准 `''` 转义），返回原串切片。
+fn split_outside_quotes(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut iter = s.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if in_quote {
+            if c == '\'' {
+                if let Some(&(_, '\'')) = iter.peek() {
+                    iter.next();
+                    continue;
+                }
+                in_quote = false;
+            }
+            continue;
+        }
+        if c == '\'' {
+            in_quote = true;
+            continue;
+        }
+        if c == sep {
+            parts.push(&s[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
 fn parse_delete(sql: &str) -> Result<SQLStatement, String> {
     let s = sql.trim();
     let rest = s.strip_prefix("DELETE FROM")
@@ -583,7 +646,7 @@ fn parse_delete(sql: &str) -> Result<SQLStatement, String> {
     if upper.starts_with("WHERE ") || upper.starts_with("WHERE\n") {
         let cond = remaining[6..].trim().to_string();
         where_clause = Some(cond);
-    } else if let Some(pos) = upper.find(" WHERE ") {
+    } else if let Some(pos) = find_keyword_outside_quotes(&remaining, " WHERE ") {
         let cond = remaining[pos + 7..].trim().to_string();
         where_clause = Some(cond);
     } else if !remaining.is_empty() {
@@ -616,18 +679,17 @@ fn parse_update(sql: &str) -> Result<SQLStatement, String> {
     }
     let after_set = rest[4..].trim().to_string(); // 去掉 "SET "
 
-    // 解析赋值列表到 WHERE 或结尾
-    let upper_after_set = after_set.to_uppercase();
-    let where_pos = upper_after_set.find(" WHERE ");
+    // 解析赋值列表到 WHERE 或结尾（WHERE 必须在引号外）
+    let where_pos = find_keyword_outside_quotes(&after_set, " WHERE ");
     let assign_part = if let Some(pos) = where_pos {
         after_set[..pos].trim().to_string()
     } else {
         after_set.trim().to_string()
     };
 
-    // 解析 "col1=val1, col2=val2"
+    // 解析 "col1=val1, col2=val2"（值里的逗号不能当分隔符）
     let mut assignments = Vec::new();
-    for part in assign_part.split(',') {
+    for part in split_outside_quotes(&assign_part, ',') {
         let part = part.trim();
         if let Some(eq_pos) = part.find('=') {
             let col = part[..eq_pos].trim().to_lowercase();
@@ -1045,6 +1107,40 @@ mod tests {
                 assert_eq!(values[0][1], "'It''s ok'");
             }
             _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_update_value_containing_comma_not_split() {
+        // 赋值值里的逗号不能当作赋值分隔符
+        let stmts = parse_sql(
+            "UPDATE t SET note = 'a, b, c', name = 'x' WHERE id = 1"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Update { assignments, where_clause, .. } => {
+                assert_eq!(assignments.len(), 2, "应解析出 2 个赋值，实际: {:?}", assignments);
+                assert_eq!(assignments[0].0, "note");
+                assert_eq!(assignments[0].1, "'a, b, c'");
+                assert_eq!(assignments[1].0, "name");
+                assert_eq!(where_clause.as_deref(), Some("id = 1"));
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_update_where_keyword_inside_string() {
+        // 字符串里的 "WHERE" 不是子句边界
+        let stmts = parse_sql(
+            "UPDATE t SET note = 'where are you' WHERE id = 2"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::Update { assignments, where_clause, .. } => {
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].1, "'where are you'");
+                assert_eq!(where_clause.as_deref(), Some("id = 2"));
+            }
+            _ => panic!("Expected Update"),
         }
     }
 }
