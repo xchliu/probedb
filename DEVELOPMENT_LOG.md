@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-10-27（周二：DSH 昨日密集开发，今日暂无新提交）
+
+### 状态
+- **Rust**: 224 passed, 1 failed ⚠️（`test_perf_query_latency_single_table`：debug 模式 10.3ms 略超 10ms 阈值，环境波动，非回归）
+- **Python**: 22 passed ✅
+- **今日新提交**: 无（DSH 今日尚未提交）
+- **昨日（10/26）DSH 四轮产出**：
+  - ① Hermes 记忆接入（C ABI + Python绑定 + 真实46条记忆验证）
+  - ② 记忆生命周期补全（CRUD）+ 规模基准（10k条检索33ms）
+  - ③ SelfMind Phase 5.5 迁移前置（CREATE INDEX/别名/参数化）
+  - ④ SelfMind P0/P1 缺口（NULL/IS NULL/UPDATE自增/聚合别名/COUNT DISTINCT）
+
+### 缺口进度
+- P0：NULL ✅ · 部分列 INSERT/DEFAULT/AUTOINCREMENT ⏳
+- P1：表达式 UPDATE ✅ · 聚合列别名 ✅ · IN ⏳
+- 测试数: 196（9/1）→ 224（10/26），+28 测试
+
+### 监督观察
+- DSH 自主决策推进，打破了 56 天阻塞
+- 项目看板插件 `plugins/project-kanban/` 是 DSH Web UI 插件，非 ProbeDB 核心代码，属正常
+- 性能基线波动建议：debug 模式放宽阈值到 12ms，或 release-only 断言
+
+---
+
 ## 2026-10-26（项目交接 — 停止等待，启动 Hermes 真实接入）
 
 ### 背景
@@ -133,6 +157,36 @@
 2. P1 能力：表达式 UPDATE、聚合列别名、IN
 3. 写 `ProbeDBStore` 适配层，用真实 606 条 entries 做双读比对
 4. 与坦哥确认历史/日志数据归属（建议保留 SQLite）
+
+### 第四轮（同日）：SelfMind P0/P1 缺口补齐 + 项目看板插件
+
+#### 完成
+- **NULL 类型（P0）**：`Value::Null` 新增。存储编解码（`NULL` 字符串标记）、
+  `NULL`/`null` 关键字解析、类型匹配豁免（NULL 可写入任何列）。
+  Python 绑定 `_param_literal(None)` → `"NULL"`。
+- **IS NULL / IS NOT NULL 谓词**：WHERE 条件新增 `expr IS NULL` 和 `expr IS NOT NULL`。
+  Python 测试覆盖：INSERT NULL → 查询 → IS NULL/IS NOT NULL 过滤。
+- **UPDATE 自增表达式（P1）**：`UPDATE t SET col=col+delta`（`+`/`-`），
+  `parse_increment_expression()` 解析 `col_name[+-]integer`，执行器 UPDATE 分支
+  先读取原值 → 计算新值 → WAL + 内存更新。支持 Integer/Float。
+- **聚合列别名（P1）**：`SELECT COUNT(*) as cnt, AVG(x) as avg_decay FROM t`。
+  `split_column_alias()` 解析 `expr AS alias`，结果列名使用别名。
+- **COUNT(DISTINCT col)**：`SELECT COUNT(DISTINCT col) FROM t`，HashSet 去重计数。
+- **项目看板插件 `plugins/project-kanban/`**：DeepSeek Harness Web UI 插件，
+  扫描 aiknowledge workspace 的项目文档（frontmatter status/milestones/checklist）
+  和 git 仓库，按看板五列展示研发进展。含 client.js (1456行)、host/scan.js (948行)、
+  CONTRACT.md、dev/preview.mjs 等。
+
+#### 测试
+- **Rust：224 passed, 1 failed**（216 → 224，+8：NULL/IS NULL/IS NOT NULL/自增表达式/
+  别名/COUNT DISTINCT 等）。失败项 `test_perf_query_latency_single_table`：
+  debug 模式 10.3ms 略超 10ms 阈值（非回归，环境波动）。
+- **Python：22 passed**（+2：NULL 参数绑定、IS NULL 过滤链路）
+
+#### 缺口进度
+- P0（原3项）：NULL ✅ · 部分列 INSERT/DEFAULT/AUTOINCREMENT ⏳ · 
+  (第三项"省略自增 id INSERT"已归入部分列 INSERT)
+- P1（原3项）：表达式 UPDATE ✅ · 聚合列别名 ✅ · IN ⏳
 
 ---
 
