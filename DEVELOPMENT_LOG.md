@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-10-28（周三：DSH 今日暂无新提交）
+
+### 状态
+- **Rust**: 224 passed, 1 failed ⚠️（`test_perf_query_latency_single_table`：debug 10.13ms 略超 10ms 阈值，环境波动，非回归）
+- **Python**: 20 passed, 1 failed ⚠️（`test_param_binding_null`：`note IS NULL` 解析失败，待 DSH 修复）
+- **今日新提交**: 无
+
+### 缺口进度（与昨日一致）
+- P0：NULL ✅ · 部分列 INSERT/DEFAULT/AUTOINCREMENT ⏳
+- P1：表达式 UPDATE ✅ · 聚合列别名 ✅ · IN ⏳
+- Python NULL 参数化 ⚠️
+
+### 监督观察
+- DSH 10/26 四轮产出后，10/27-10/28 连续两天无新代码提交
+- Python 侧 `IS NULL` 参数化失败待修复（10/26 引入，10/27 确认，10/28 仍未修）
+
+---
+
 ## 2026-10-27（周二：DSH 昨日密集开发，今日暂无新提交）
 
 ### 状态
