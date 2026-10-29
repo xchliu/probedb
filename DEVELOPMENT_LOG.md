@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-10-29（周四：DSH 连续第三天无新提交 ⚠️）
+
+### 状态
+- **Rust**: 224 passed, 1 failed ⚠️（`test_perf_query_latency_single_table`：debug 10.16ms > 10ms 阈值，环境波动，非回归）
+- **Python**: 20 passed, 1 failed ⚠️（`test_unsupported_predicate_raises_not_silent`：变更为此项失败，非昨日 `test_param_binding_null`，原因待查）
+- **今日新提交**: 无
+
+### 缺口进度（与 10/26 完全一致，3天无推进）
+- P0：NULL ✅ · 部分列 INSERT/DEFAULT/AUTOINCREMENT ⏳
+- P1：表达式 UPDATE ✅ · 聚合列别名 ✅ · IN ⏳
+- Python NULL/IS NULL 参数化 ⚠️
+
+### 监督观察
+- 🔴 DSH 10/26 四轮密集产出后，10/27-10/29 **连续三天零代码提交**
+- 缺口从 10/26 起无任何推进
+- Python 测试失败项从 `test_param_binding_null` 变为 `test_unsupported_predicate_raises_not_silent`（代码未变但失败项变化，疑似环境差异）
+- 14:00 开发时段推送坦哥
+
+---
+
 ## 2026-10-28（周三：DSH 今日暂无新提交）
 
 ### 状态
