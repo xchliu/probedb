@@ -4,6 +4,27 @@
 
 ---
 
+## 2026-11-02（周一：新一周开始，DSH 仍无新提交）
+
+### 状态
+- **Rust**: 224 passed, 1 failed ⚠️（`test_perf_query_latency_single_table`：debug avg=10.34ms > 10ms 阈值，环境波动，非回归）
+- **Python**: 20 passed, 1 failed ⚠️（`test_unsupported_predicate_raises_not_silent`：IN 谓词未按预期报错）
+- **今日新提交**: 无（上一次实质提交仍为 10/26）
+- **Repo**: 干净，无未提交变更
+
+### 缺口进度（10/26 起持续未推进）
+- P0：NULL ✅ · 部分列 INSERT/DEFAULT/AUTOINCREMENT ⏳
+- P1：表达式 UPDATE ✅ · 聚合列别名 ✅ · IN ⏳
+- Python NULL/IS NULL 参数化 ⚠️
+
+### 监督观察
+- ⚠️ DSH 自 10/26 四轮密集产出后，10/27 至今无实质代码提交（已 7 天）
+- 本周计划（11/02-11/06）尚未更新，上周计划已过期
+- 性能基线 debug 模式偶发超阈值，已在 10/30 建议放宽到 12ms
+- 待确认事项表中 2 项（Hermes 接入/C ABI）实际已由 DSH 完成但未勾销
+
+---
+
 ## 2026-10-30（周五：DSH 连续第四天无新提交 🔴 本周结束）
 
 ### 状态
