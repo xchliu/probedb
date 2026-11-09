@@ -141,13 +141,32 @@ class BindingTests(unittest.TestCase):
             )
             self.assertEqual(r.rows, [["e1"]])
 
+    def test_in_predicate_supported(self):
+        with ProbeDB.open() as db:
+            db.execute("CREATE TABLE t (id TEXT, n INTEGER)")
+            db.execute("INSERT INTO t (id, n) VALUES ('a', 1)")
+            db.execute("INSERT INTO t (id, n) VALUES ('b', 2)")
+            db.execute("INSERT INTO t (id, n) VALUES ('c', 3)")
+            self.assertEqual(
+                db.execute("SELECT id FROM t WHERE id IN ('a','c') ORDER BY id").rows,
+                [["a"], ["c"]],
+            )
+            self.assertEqual(
+                db.execute("SELECT id FROM t WHERE n IN (2,3) ORDER BY id").rows,
+                [["b"], ["c"]],
+            )
+            self.assertEqual(
+                db.execute("SELECT id FROM t WHERE id NOT IN ('b') ORDER BY id").rows,
+                [["a"], ["c"]],
+            )
+
     def test_unsupported_predicate_raises_not_silent(self):
         # 不支持的条件必须报错，不能静默返回空集
         with ProbeDB.open() as db:
             db.execute("CREATE TABLE t (id TEXT)")
             db.execute("INSERT INTO t (id) VALUES ('a')")
             with self.assertRaises(ProbeDBError) as ctx:
-                db.execute("SELECT id FROM t WHERE id IN ('a')")
+                db.execute("SELECT id FROM t WHERE id BETWEEN 'a' AND 'c'")
             self.assertIn("无法解析条件", str(ctx.exception))
 
     def test_records_by_column_name(self):

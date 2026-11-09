@@ -9,7 +9,7 @@ AI 原生嵌入式数据库。Rust 实现，**零外部依赖**（没有任何�
 | 项目 | 状态 |
 |---|---|
 | Rust 核心 | 约 9k 行，零第三方依赖 |
-| 测试 | **225 个 Rust 测试 + 20 个 Python 测试，全绿** |
+| 测试 | **229 个 Rust 测试 + 22 个 Python 测试，全绿**（性能断言需 `PROBEDB_PERF_STRICT=1` 才严格失败） |
 | Hermes 接入验证 | ✅ 已导入真实 `~/.hermes/memories`（46 条）并完成跨进程检索 |
 | SelfMind 兼容验收 | ✅ [tools/selfmind_compat.py](tools/selfmind_compat.py) PASS（schema 初始化 / 别名 JOIN / 参数化查询） |
 | 候选评估 | [Hermes](docs/hermes-integration.md) · [SelfMind 迁移评估](docs/selfmind-migration-assessment.md) |
@@ -49,9 +49,10 @@ python3 tools/bench_probedb.py --sizes 100,1000,5000,10000
 
 ## 能力
 
-- **SQL 子集**：`CREATE TABLE [IF NOT EXISTS]`、`INSERT`（列清单可任意顺序，也支持省略列清单）、`SELECT`（`WHERE`、`LIKE`、`ORDER BY` 多列、`LIMIT/OFFSET`、`DISTINCT`、`GROUP BY` + `HAVING`、`SUM/AVG/MIN/MAX`、`INNER JOIN` + **表别名**）、`UPDATE`、`DELETE`、`DROP TABLE`、`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`（兼容层：校验后接受，暂不建物理索引）
+- **SQL 子集**：`CREATE TABLE [IF NOT EXISTS]`、`INSERT`（列清单可任意顺序，也支持省略列清单）、`SELECT`（`WHERE`、`LIKE`、`IN / NOT IN`、`IS NULL / IS NOT NULL`、`ORDER BY` 多列、`LIMIT/OFFSET`、`DISTINCT`、`GROUP BY` + `HAVING`、`SUM/AVG/MIN/MAX`、`COUNT(DISTINCT col)`、`INNER JOIN` + **表别名**、**聚合列别名**）、`UPDATE`（支持 `col=col+1`）、`DELETE`、`DROP TABLE`、`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`（兼容层：校验后接受，暂不建物理索引）
+- **NULL 语义**：支持写入/查询 `NULL`（`IS NULL` / `IS NOT NULL`），NULL 结果以 `"NULL"` 返回（行值协议尚未类型化）
 - **SQL 兼容细节**：`--` 行注释、`''` 转义、字符串内分号/括号、`IF NOT EXISTS` 幂等、表级约束子句跳过；WHERE 操作符两侧可有/无空格
-- **参数化 API**（Python）：`db.execute(sql, params=(...))`、`execute_all`、`executescript`、`commit`、`last_row_id`、`Result.records`
+- **参数化 API**（Python）：`db.execute(sql, params=(...))`、`execute_all`、`executescript`、`commit`、`last_row_id`、`Result.records`；`None` → SQL NULL
 - **类型**：`INTEGER`、`FLOAT`、`TEXT`、`BOOLEAN`、`DATE`、`TIME`、`VECTOR(n)`（向量是一等公民）
 - **向量检索**：`WHERE vector_similarity(emb, '[1,2,3]') > 0.8 ORDER BY ... DESC`（余弦 / 欧氏，暴力搜索）
 - **持久化**：全量快照 + WAL 增量 + FNV-1a 校验和 + 崩溃恢复；`persist()` 先 flush WAL 再原子写快照
@@ -86,18 +87,19 @@ docs/
 - **存储模型**：数据全在内存，`persist()` 全量重写快照。适合个人记忆/Agent 状态这类小数据（MB 级），不适合 GB 级数据集。
 - **无索引、无事务**：`CREATE INDEX` 仅语法兼容（校验后接受），查询仍全表扫描；多行写入中途失败会留下部分写入。
 - **无并发写**：一个句柄同一时刻只应被一个线程使用（Python 绑定已用 Lock 串行化；C 侧调用方自行保证）。
-- **无 NULL / DEFAULT / AUTOINCREMENT**：部分列插入会明确报错，而不是用默认值/零值填补（SelfMind 迁移的 P0 缺口）。
-- **SQL 兼容缺口**：`IN`、表达式 UPDATE（`col=col+1`）、聚合列别名（`COUNT(*) as cnt`）、`last_insert_rowid()` 函数尚未支持。
-- **JSON 行值统一为字符串**（VECTOR 形如 `[1,2,3]`）；类型化协议是下一步。
+- **DEFAULT / AUTOINCREMENT 未实现**：省略列的部分列插入仍会报错（SelfMind 迁移剩余 P0；历史/日志表依赖自增 id）。
+- **SQL 兼容缺口**：`DATE()` 等函数、`last_insert_rowid()` SQL 函数、`COUNT(DISTINCT)` 的 GROUP BY 组合尚未支持。
+- **JSON 行值统一为字符串**（NULL → `"NULL"`，VECTOR → `"[1,2,3]"`）；类型化协议是下一步。
 - **向量为暴力搜索**，HNSW 尚未实现。
 
 ## 路线图
 
-1. **SelfMind 迁移前置**（进行中）：验收 4 条标准已 PASS；下一步补 NULL / 部分列插入 / 表达式 UPDATE / 聚合别名 / IN。
-2. **Hermes 记忆接入**：独立 CLI/工具已跑通，下一步在 Hermes 侧挂载为记忆读写通道。
-3. **协议升级**：类型化行值 + C 层参数绑定（当前参数绑定在 Python 客户端完成）。
-4. **存储升级**：索引、事务、增量快照；再评估替换内部存储。
-5. **AI 原生能力**：NL2SQL、自动索引、向量索引、自治（远期）。
+1. **SelfMind 迁移前置**（进行中）：4 条验收标准 PASS；NULL / 表达式 UPDATE / 聚合别名 / IN 已完成，剩余 DEFAULT/AUTOINCREMENT + 部分列插入。
+2. **SelfMind 正式接入**：补完 P0 后写 `ProbeDBStore` 适配层，用真实 606 条 entries 做双读比对。
+3. **Hermes 记忆接入**：独立 CLI/工具已跑通，下一步在 Hermes 侧挂载为记忆读写通道。
+4. **协议升级**：类型化行值 + C 层参数绑定（当前参数绑定在 Python 客户端完成）。
+5. **存储升级**：索引、事务、增量快照；再评估替换内部存储。
+6. **AI 原生能力**：NL2SQL、自动索引、向量索引、自治（远期）。
 
 ## 开发约定
 

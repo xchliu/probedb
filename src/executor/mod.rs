@@ -4103,4 +4103,120 @@ mod tests {
             _ => panic!("Expected SelectResult"),
         }
     }
+
+    // ===== SQLite 兼容语义：NULL / IN / 别名 / 自增 UPDATE（SelfMind 迁移所需）=====
+
+    fn select_rows(executor: &mut Executor, sql: &str) -> Vec<Vec<String>> {
+        let r = executor.execute(parse_sql(sql).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { rows, .. } => rows.clone(),
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_null_values_and_is_null() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, note TEXT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, note) VALUES (1, NULL)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, note) VALUES (2, 'x')").unwrap()).unwrap();
+
+        // NULL 以 "NULL" 形式投影；IS NULL / IS NOT NULL 可区分
+        assert_eq!(select_rows(&mut executor, "SELECT note FROM t WHERE id=1"), vec![vec!["NULL".to_string()]]);
+        assert_eq!(select_rows(&mut executor, "SELECT id FROM t WHERE note IS NULL"), vec![vec!["1".to_string()]]);
+        assert_eq!(select_rows(&mut executor, "SELECT id FROM t WHERE note IS NOT NULL"), vec![vec!["2".to_string()]]);
+        // `= NULL` 不命中（NULL 不可比较）
+        assert!(select_rows(&mut executor, "SELECT id FROM t WHERE note = NULL").is_empty());
+    }
+
+    #[test]
+    fn test_in_and_not_in_predicates() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id TEXT, n INTEGER)").unwrap()).unwrap();
+        for (id, n) in [("a", 1), ("b", 2), ("c", 3)] {
+            executor.execute(parse_sql(&format!(
+                "INSERT INTO t (id, n) VALUES ('{}', {})", id, n
+            )).unwrap()).unwrap();
+        }
+        assert_eq!(
+            select_rows(&mut executor, "SELECT id FROM t WHERE id IN ('a','c') ORDER BY id"),
+            vec![vec!["a".to_string()], vec!["c".to_string()]]
+        );
+        assert_eq!(
+            select_rows(&mut executor, "SELECT id FROM t WHERE n IN (2,3) ORDER BY id"),
+            vec![vec!["b".to_string()], vec!["c".to_string()]]
+        );
+        assert_eq!(
+            select_rows(&mut executor, "SELECT id FROM t WHERE id NOT IN ('b') ORDER BY id"),
+            vec![vec!["a".to_string()], vec!["c".to_string()]]
+        );
+        // 空列表 → 不命中
+        assert!(select_rows(&mut executor, "SELECT id FROM t WHERE id IN ()").is_empty());
+    }
+
+    #[test]
+    fn test_aggregate_aliases_and_count_distinct() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, kind TEXT, score FLOAT)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, kind, score) VALUES (1, 'a', 1.0)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, kind, score) VALUES (2, 'a', 3.0)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, kind, score) VALUES (3, 'b', 5.0)").unwrap()).unwrap();
+
+        let r = executor.execute(parse_sql("SELECT COUNT(*) as cnt FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["cnt".to_string()]);
+                assert_eq!(rows, &vec![vec!["3".to_string()]]);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let r = executor.execute(parse_sql("SELECT AVG(score) as avg_score FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["avg_score".to_string()]);
+                assert_eq!(rows[0][0], "3");
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let r = executor.execute(parse_sql(
+            "SELECT kind, COUNT(*) as cnt FROM t GROUP BY kind ORDER BY kind"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["kind".to_string(), "cnt".to_string()]);
+                assert_eq!(rows, &vec![vec!["a".to_string(), "2".to_string()], vec!["b".to_string(), "1".to_string()]]);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        let r = executor.execute(parse_sql("SELECT COUNT(DISTINCT kind) as n FROM t").unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["n".to_string()]);
+                assert_eq!(rows, &vec![vec!["2".to_string()]]);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+    }
+
+    #[test]
+    fn test_increment_update_expression() {
+        let mut executor = Executor::new();
+        executor.execute(parse_sql(
+            "CREATE TABLE t (id INTEGER, access_count INTEGER)"
+        ).unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, access_count) VALUES (1, 5)").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (id, access_count) VALUES (2, 0)").unwrap()).unwrap();
+
+        executor.execute(parse_sql(
+            "UPDATE t SET access_count=access_count+1 WHERE id=1"
+        ).unwrap()).unwrap();
+        assert_eq!(select_rows(&mut executor, "SELECT access_count FROM t WHERE id=1"), vec![vec!["6".to_string()]]);
+
+        executor.execute(parse_sql("UPDATE t SET access_count=access_count+10").unwrap()).unwrap();
+        assert_eq!(select_rows(&mut executor, "SELECT access_count FROM t WHERE id=1"), vec![vec!["16".to_string()]]);
+        assert_eq!(select_rows(&mut executor, "SELECT access_count FROM t WHERE id=2"), vec![vec!["10".to_string()]]);
+    }
 }
