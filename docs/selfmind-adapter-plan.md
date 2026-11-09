@@ -152,3 +152,33 @@ class ProbeDBConnection:
 - `DATE(timestamp)` / `GROUP BY DATE(timestamp)`：`get_overall_decay_trend` 等趋势接口需要
 - 事务 `BEGIN/COMMIT`（当前 SelfMind 未使用）
 - 全量历史/快照/日志表（按评估继续留 SQLite）
+
+## 九、安装包（2026-11-09 晚）
+
+已把落地动作做成可审查的安装包：`integrations/selfmind/`
+
+| 文件 | 作用 |
+|---|---|
+| `install.py` | 复制兼容层 + 给 `unified_store.py` 注入连接工厂（`.bak` 备份、幂等、支持 `--dry-run`） |
+| `probedb_conn.py` | sqlite3 兼容层 |
+| `README.md` | 安装 / 启用 / 回滚说明 |
+| `tools/selfmind_landing_check.py` | 在 SelfMind 源码副本上端到端验证安装包 |
+
+安装包验证结果（真实 `selfmind_hermes.db`，612 entries）：
+
+```
+✅ 安装脚本执行 / 连接工厂注入 / probedb_conn 复制
+✅ UnifiedStore 以 probedb 后端启动
+✅ get_all_entries 逐行一致（612 vs 612，diffs=0）
+✅ get_stats 一致
+结果: PASS
+```
+
+落地命令（拿到写权限后）：
+
+```bash
+python3 integrations/selfmind/install.py --selfmind-root ~/Documents/selfmind
+SELFMIND_BACKEND=probedb SELFMIND_PROBEDB_PATH=... python3 server.py
+```
+
+回滚：恢复 `unified_store.py.bak` + 删除 `probedb_conn.py`。

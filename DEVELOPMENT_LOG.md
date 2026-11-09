@@ -105,6 +105,34 @@
 - 历史/快照/日志表继续留 SQLite（按评估）
 - 适配层代码尚未复制进 SelfMind 仓库（无写权限）
 
+### 当日下午第四轮：SelfMind 安装包（可一键落地 + 端到端验证）
+
+#### 完成
+- **`integrations/selfmind/install.py`**：安装器——复制 `probedb_conn.py`、给
+  `unified_store.py` 注入 `_make_connection()` 并替换 `__init__`/`switch_db` 两处
+  `sqlite3.connect`；自动 `.bak` 备份、幂等、支持 `--dry-run`。
+- **`integrations/selfmind/README.md`**：安装 / 启用（`SELFMIND_BACKEND=probedb`）/ 回滚说明。
+- **`tools/selfmind_landing_check.py`**：把 SelfMind 源码复制到临时目录 → 安装 →
+  导入打过补丁的 `UnifiedStore` → ProbeDB/SQLite 双后端逐行比对。
+- **`python/test_selfmind_install.py`**：安装器 4 个单测（注入/幂等/异常结构/临时树安装）。
+
+#### 验证（真实 `selfmind_hermes.db`，612 entries）
+```
+✅ 安装脚本执行 / 连接工厂注入 / probedb_conn 复制
+✅ UnifiedStore 以 probedb 后端启动
+✅ get_all_entries 逐行一致（612 vs 612，diffs=0）
+✅ get_stats 一致
+结果: PASS
+```
+
+#### 测试
+- Rust **232 passed**
+- Python **31 passed**（+4 安装器测试）
+
+#### 阻塞
+- SelfMind 源仓库仍无写权限（本轮再次验证失败），安装脚本目前只在临时副本验证；
+  拿到权限后一条命令即可落地。
+
 ## 2026-11-06（周五：DSH 连续第12天零代码提交 🔴）
 
 ### 状态
