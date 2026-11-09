@@ -30,8 +30,8 @@ Hermes 的文档只列了 3 个阻断项；实际 `unified_store.py` 还需要�
 | 缺口 | 实际用法 | 现状 | 影响 |
 |---|---|---|---|
 | **NULL** | 27 列 entries 中大量可空字段；32 处参数化查询可能传 `None` | ✅ 已支持（`None` → NULL，`IS NULL/IS NOT NULL`；结果以 `"NULL"` 返回） | 已解决 |
-| **省略自增 id 的 INSERT** | `entry_history / snapshots / decay_history / operations_log / agent_recall_log` 都不传 `id` | ❌ 仍不支持部分列插入 | **剩余 P0** |
-| **DEFAULT / AUTOINCREMENT 语义** | DDL 中大量 `DEFAULT ...`、`id INTEGER PRIMARY KEY AUTOINCREMENT` | ❌ DDL 解析忽略，不填默认值 | **剩余 P0**（与上一条一起做） |
+| **省略自增 id 的 INSERT** | `entry_history / snapshots / decay_history / operations_log / agent_recall_log` 都不传 `id` | ✅ 已支持部分列插入 + `AUTOINCREMENT` | 已解决 |
+| **DEFAULT / AUTOINCREMENT 语义** | DDL 中大量 `DEFAULT ...`、`id INTEGER PRIMARY KEY AUTOINCREMENT` | ✅ 解析、持久化（快照 COLDEF + WAL C 记录）、重启后继续生效 | 已解决 |
 | **表达式 UPDATE** | `UPDATE entries SET access_count=access_count+1 ...` | ✅ 已支持同列 ± 整数 | 已解决 |
 | **聚合列别名** | `SELECT COUNT(*) as cnt`、`AVG(decay_score) as avg_decay` | ✅ 已支持（单列 & GROUP BY） | 已解决 |
 | **IN 谓词** | `entry_id IN (?,?,...)`（recall scanner） | ✅ 已支持 `IN / NOT IN` 字面量列表 | 已解决 |
@@ -72,14 +72,22 @@ ProbeDB 当前存储模型是**全内存 + `persist()` 全量快照**：
 
 ## 五、建议的下一步
 
-1. **剩余 P0**（下一轮）：部分列插入 + DEFAULT/AUTOINCREMENT —— 做完后 `unified_store` 的历史/日志表才可写入。
-2. **P1**：`DATE()` 函数 / GROUP BY 表达式（decay trend 接口）、`last_insert_rowid()` SQL 兼容。
-3. **写适配层**：`ProbeDBStore` 实现 UnifiedStore 被用到的子集；用真实 606 条 entries 做**双读比对**（SQLite vs ProbeDB）。
-4. **确定历史数据归属**（建议保留 SQLite），再谈 entries 的切换。
-5. 向量语义搜索作为增益项：需要 embedding 来源，当前 SelfMind 没有，先不做。
+1. **适配层落地**（需 SelfMind 写权限）：见 [selfmind-adapter-plan.md](selfmind-adapter-plan.md)——
+   用 `ProbeDBConnection` 兼容层接入 `unified_store.py`，先做 entries 双读比对（606 条）。
+2. **P1 SQL**：`DATE()` 函数 / GROUP BY 表达式（decay trend 接口）、事务 `BEGIN/COMMIT`。
+3. **确定历史数据归属**（建议保留 SQLite），再谈 entries 的切换。
+4. 向量语义搜索作为增益项：需要 embedding 来源，当前 SelfMind 没有，先不做。
 
-> 2026-11-09 更新：NULL / 表达式 UPDATE / 聚合别名 / IN / COUNT(DISTINCT) 已完成；
-> 仅剩 DEFAULT/AUTOINCREMENT + 部分列插入 是 P0 阻断。
+> 2026-11-09 更新（P0 全部完成）：
+> NULL、IN、聚合别名、表达式 UPDATE、`COUNT(DISTINCT)`、**部分列插入 + DEFAULT/AUTOINCREMENT** 均已支持；
+> 列约束会随快照（COLDEF）与 WAL（C 记录）一起持久化，重启后继续生效。
+> `tools/selfmind_compat.py` 对 SelfMind 真实 schema 的历史/日志表写入验证通过。
+
+### 同轮修复的恢复问题
+
+- **首次 persist 前崩溃会丢数据**：`ProbeDB::open()` 原来只在"快照文件存在"时重放 WAL；
+  若建表/插入后、persist 前崩溃，重新打开会把 WAL 当新库忽略。已修复为"快照不存在但 WAL 存在时也重放"。
+- **WAL 重放后自增计数器未推进**：重放 INSERT 使用显式 row_id 时现在会同步推进 `next_id`，避免复用 id。
 
 ## 六、复现方式
 

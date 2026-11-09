@@ -52,10 +52,20 @@ impl ProbeDB {
                 (engine, None)
             }
         } else {
-            // 新库：同时创建空引擎和 WAL（从第一条 DML 就开始记录）
+            // 快照还不存在，但可能已经有 WAL（首次 persist 前崩溃）：
+            // 必须重放 WAL，否则已写操作会丢失。
             let wal_path = format!("{}.wal", path);
-            let wal = persistence::wal::WalLog::open(&wal_path)?;
-            (storage::StorageEngine::new(), Some(wal))
+            let wal_existed = Path::new(&wal_path).exists();
+            let mut engine = storage::StorageEngine::new();
+            let mut wal = persistence::wal::WalLog::open(&wal_path)?;
+            if wal_existed {
+                let replayed = wal.replay(&mut engine)?;
+                if replayed > 0 {
+                    persistence::save(&engine, path)?;
+                    wal.truncate()?;
+                }
+            }
+            (engine, Some(wal))
         };
         Ok(ProbeDB {
             executor: Executor { engine, wal },
@@ -282,9 +292,14 @@ mod tests {
         // 插入不存在的表
         assert!(db.execute("INSERT INTO ghost (id) VALUES (1)").is_err());
 
-        // 列数不匹配
+        // 列数不匹配：省略列清单时必须提供全部列
         assert!(db.execute("CREATE TABLE ctest (id INTEGER, name TEXT)").is_ok());
-        assert!(db.execute("INSERT INTO ctest (id) VALUES (1)").is_err(), "缺列插入当前版本不支持，应返回错误");
+        assert!(
+            db.execute("INSERT INTO ctest VALUES (1)").is_err(),
+            "省略列清单但值数量不足，应返回错误"
+        );
+        // 部分列插入已支持：缺列按 NULL/DEFAULT 填充
+        assert!(db.execute("INSERT INTO ctest (id) VALUES (1)").is_ok());
     }
 
     #[test]
@@ -1400,5 +1415,78 @@ mod tests {
         let mut db = ProbeDB::new();
         let err = db.execute_json("SELECT * FROM ghost").unwrap_err();
         assert!(err.contains("ghost"), "{}", err);
+    }
+
+    // ===== DEFAULT / AUTOINCREMENT：快照与 WAL 恢复 =====
+
+    const CONSTRAINED_DDL: &str = "CREATE TABLE events (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        title TEXT NOT NULL, \
+        kind TEXT DEFAULT 'memory', \
+        importance REAL DEFAULT 0.5\
+    )";
+
+    #[test]
+    fn test_persist_and_reload_preserves_column_constraints() {
+        let path = temp_db_path("probedb_constraints_persist.pdb");
+        let cleanup = |p: &str| {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+        };
+        cleanup(&path);
+
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            db.execute(CONSTRAINED_DDL).unwrap();
+            db.execute("INSERT INTO events (title) VALUES ('first')").unwrap();
+            db.persist().unwrap();
+        }
+
+        // 重开（快照 COLDEF 恢复约束）→ 继续省略 id/kind/importance 插入
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            db.execute("INSERT INTO events (title) VALUES ('second')").unwrap();
+            let r = db.execute(
+                "SELECT id, title, kind, importance FROM events ORDER BY id"
+            ).unwrap();
+            assert!(r.contains("1 | first | memory | 0.5"), "{}", r);
+            assert!(r.contains("2 | second | memory | 0.5"), "{}", r);
+            db.persist().unwrap();
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_wal_recovery_preserves_column_constraints() {
+        let path = temp_db_path("probedb_constraints_wal.pdb");
+        let cleanup = |p: &str| {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}.wal", p));
+            let _ = std::fs::remove_file(format!("{}.tmp", p));
+        };
+        cleanup(&path);
+
+        // 建表 + 只写 WAL 的插入，不 persist → 模拟崩溃
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            db.execute(CONSTRAINED_DDL).unwrap();
+            db.execute("INSERT INTO events (title) VALUES ('first')").unwrap();
+        }
+
+        // 重开 → WAL 重放 T/C/I 记录，约束必须一起恢复
+        {
+            let mut db = ProbeDB::open(&path).unwrap();
+            db.execute("INSERT INTO events (title) VALUES ('second')").unwrap();
+            let r = db.execute(
+                "SELECT id, title, kind, importance FROM events ORDER BY id"
+            ).unwrap();
+            assert!(r.contains("1 | first | memory | 0.5"), "WAL 恢复默认值失败: {}", r);
+            assert!(r.contains("2 | second | memory | 0.5"), "WAL 恢复自增失败: {}", r);
+            db.persist().unwrap();
+        }
+
+        cleanup(&path);
     }
 }

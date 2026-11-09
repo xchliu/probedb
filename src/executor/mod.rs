@@ -70,12 +70,50 @@ impl Executor {
                         }
                     }).collect(),
                 };
-                // WAL 先写（T 记录），成功后改内存
+
+                // 先解析列级约束（DEFAULT 在这里就做类型校验，错误在建表时暴露）
+                let mut resolved_constraints: Vec<(String, ColumnConstraints)> = Vec::new();
+                for col in &columns {
+                    let default_value = match &col.default_literal {
+                        Some(lit) => Some(parse_value(lit, &col.data_type).map_err(|e| {
+                            format!("列 '{}' 的 DEFAULT 值 '{}' 无效: {}", col.name, lit, e)
+                        })?),
+                        None => None,
+                    };
+                    if default_value.is_some() || col.auto_increment || col.not_null {
+                        resolved_constraints.push((col.name.clone(), ColumnConstraints {
+                            default_value,
+                            auto_increment: col.auto_increment,
+                            not_null: col.not_null,
+                        }));
+                    }
+                }
+
+                // WAL 先写（T 记录 + 每列约束 C 记录），成功后改内存
                 let cols: Vec<String> = schema.columns.iter()
                     .map(|c| format!("{}:{}", c.name, crate::storage::encode_type(&c.data_type)))
                     .collect();
                 self.append_wal(&format!("T|{}|{}", name, cols.join("|")))?;
+                for (col_name, c) in &resolved_constraints {
+                    let default_hex = match &c.default_value {
+                        Some(v) => crate::storage::hex_encode(
+                            crate::storage::encode_value(v).as_bytes()
+                        ),
+                        None => String::new(),
+                    };
+                    self.append_wal(&format!(
+                        "C|{}|{}|{}|{}|{}",
+                        name,
+                        col_name,
+                        if c.auto_increment { 1 } else { 0 },
+                        if c.not_null { 1 } else { 0 },
+                        default_hex
+                    ))?;
+                }
                 self.engine.create_table(schema)?;
+                for (col_name, c) in resolved_constraints {
+                    self.engine.set_column_constraints(&name, &col_name, c)?;
+                }
                 Ok(ExecuteResult::TableCreated { name })
             }
 
@@ -106,13 +144,24 @@ impl Executor {
                 let schema = self.engine.get_schema(&table_name)?;
                 let col_types: Vec<_> = schema.columns.iter().map(|c| c.data_type.clone()).collect();
                 let col_names: Vec<_> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                // 列级约束（DEFAULT / AUTOINCREMENT / NOT NULL）
+                let col_constraints: Vec<Option<ColumnConstraints>> = col_names.iter()
+                    .map(|n| self.engine.column_constraints(&table_name, n).cloned())
+                    .collect();
 
-                // 目标列映射：显式列清单 → schema 下标（允许任意顺序）；
-                // 省略列清单 → 按表结构顺序全列插入。
-                // 之前这里忽略了 columns，导致 `INSERT INTO t (b, a) VALUES ...`
-                // 按位置静默写错列——已修复为按列名映射。
+                // 目标列映射：显式列清单 → schema 下标（允许任意顺序、允许只给部分列）；
+                // 省略列清单 → 必须按表结构提供全部列（SQLite 语义）。
                 let target_indices: Vec<usize> = if columns.is_empty() {
-                    (0..col_names.len()).collect()
+                    let all: Vec<usize> = (0..col_names.len()).collect();
+                    for row_values in &values {
+                        if row_values.len() != all.len() {
+                            return Err(format!(
+                                "列数不匹配：省略列清单时必须提供表 '{}' 的全部 {} 列，本行提供了 {} 个",
+                                table_name, all.len(), row_values.len()
+                            ));
+                        }
+                    }
+                    all
                 } else {
                     let mut idxs = Vec::with_capacity(columns.len());
                     for col in &columns {
@@ -126,21 +175,17 @@ impl Executor {
                         }
                         idxs.push(pos);
                     }
-                    // 行是定长的（无 NULL/DEFAULT 概念），部分列插入没有安全的默认值，
-                    // 明确报错优于用零值填空导致数据静默失真。
-                    if idxs.len() != col_names.len() {
-                        return Err(format!(
-                            "暂不支持部分列插入：表 '{}' 有 {} 列（{}），INSERT 只提供了 {} 列",
-                            table_name, col_names.len(), col_names.join(", "), idxs.len()
-                        ));
-                    }
                     idxs
                 };
 
-                let rows_parsed: Result<Vec<Vec<Value>>, String> = values.iter().map(|row_values| {
+                // 自增列的基础值：与隐藏 row_id 对齐（第 r 行 = base + r）
+                let base_row_id = self.engine.next_id();
+
+                let mut parsed_rows: Vec<Vec<Value>> = Vec::with_capacity(values.len());
+                for (row_index, row_values) in values.iter().enumerate() {
                     if row_values.len() != target_indices.len() {
                         return Err(format!(
-                            "列数不匹配：表 '{}' 需要 {} 个值，本行提供了 {} 个",
+                            "列数不匹配：表 '{}' 本行需要 {} 个值，实际提供了 {} 个",
                             table_name, target_indices.len(), row_values.len()
                         ));
                     }
@@ -151,14 +196,45 @@ impl Executor {
                         // 保留底层解析原因（格式错误/日期越界/类型不符），否则用户只看到"无法解析"
                         let value = parse_value(val_str, &col_types[schema_idx])
                             .map_err(|e| format!("无法解析列 '{}' 的值 '{}': {}", col_names[schema_idx], shown, e))?;
+                        if matches!(value, Value::Null)
+                            && col_constraints[schema_idx].as_ref().map_or(false, |c| c.not_null)
+                        {
+                            return Err(format!("列 '{}' 声明了 NOT NULL，不能写入 NULL", col_names[schema_idx]));
+                        }
                         parsed[schema_idx] = Some(value);
                     }
-                    Ok(parsed.into_iter().map(|v| v.expect("全列已填充")).collect())
-                }).collect();
-                let all_parsed = rows_parsed?;
-                let count = all_parsed.len();
+
+                    // 省略列：AUTOINCREMENT → 自动分配；DEFAULT → 用默认值；
+                    // NOT NULL 且无默认 → 报错；其余 → NULL
+                    for (idx, slot) in parsed.iter_mut().enumerate() {
+                        if slot.is_some() {
+                            continue;
+                        }
+                        if let Some(c) = col_constraints[idx].as_ref() {
+                            if c.auto_increment {
+                                // 自增列值与隐藏 row_id 对齐（均为 i64 存储）
+                                *slot = Some(Value::Integer((base_row_id + row_index as u64) as i64));
+                                continue;
+                            }
+                            if let Some(default) = &c.default_value {
+                                *slot = Some(default.clone());
+                                continue;
+                            }
+                            if c.not_null {
+                                return Err(format!(
+                                    "列 '{}' 声明了 NOT NULL 且没有 DEFAULT，INSERT 必须提供该列",
+                                    col_names[idx]
+                                ));
+                            }
+                        }
+                        *slot = Some(Value::Null);
+                    }
+                    parsed_rows.push(parsed.into_iter().map(|v| v.expect("全列已填充")).collect());
+                }
+
+                let count = parsed_rows.len();
                 let mut last_row_id = 0u64;
-                for row in all_parsed {
+                for row in parsed_rows {
                     // WAL 先写（I 记录，显式 row_id），成功后改内存
                     let row_id = self.engine.next_id();
                     let vals: Vec<String> = row.iter().map(crate::storage::encode_value).collect();
@@ -3934,13 +4010,34 @@ mod tests {
 
     #[test]
     fn test_insert_partial_columns_errors() {
-        // 没有 NULL/DEFAULT 概念时，部分列插入必须明确报错而不是补零
+        // 部分列插入：缺列 → AUTOINCREMENT 自动分配 / DEFAULT 默认值 / NULL
         let mut executor = Executor::new();
-        executor.execute(parse_sql("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)").unwrap()).unwrap();
-        let err = executor.execute(parse_sql(
-            "INSERT INTO t (id, name) VALUES (1, 'alice')"
-        ).unwrap()).unwrap_err();
-        assert!(err.contains("部分列"), "应提示不支持部分列插入，实际: {}", err);
+        executor.execute(parse_sql(
+            "CREATE TABLE t (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                name TEXT, \
+                active BOOLEAN DEFAULT true, \
+                tags TEXT DEFAULT '[]', \
+                mandatory TEXT NOT NULL DEFAULT 'ok'\
+            )"
+        ).unwrap()).unwrap();
+
+        executor.execute(parse_sql("INSERT INTO t (name) VALUES ('alice')").unwrap()).unwrap();
+        executor.execute(parse_sql("INSERT INTO t (name) VALUES ('bob')").unwrap()).unwrap();
+
+        let rows = select_rows(&mut executor, "SELECT id, name, active, tags, mandatory FROM t ORDER BY id");
+        assert_eq!(rows, vec![
+            vec!["1".to_string(), "alice".to_string(), "true".to_string(), "[]".to_string(), "ok".to_string()],
+            vec!["2".to_string(), "bob".to_string(), "true".to_string(), "[]".to_string(), "ok".to_string()],
+        ]);
+
+        // NOT NULL 且没有 DEFAULT → 省略报错
+        executor.execute(parse_sql("CREATE TABLE u (id INTEGER, must TEXT NOT NULL)").unwrap()).unwrap();
+        let err = executor.execute(parse_sql("INSERT INTO u (id) VALUES (1)").unwrap()).unwrap_err();
+        assert!(err.contains("NOT NULL"), "{}", err);
+        // 显式写 NULL 到 NOT NULL 列 → 报错
+        let err = executor.execute(parse_sql("INSERT INTO u (id, must) VALUES (1, NULL)").unwrap()).unwrap_err();
+        assert!(err.contains("NOT NULL"), "{}", err);
     }
 
     #[test]

@@ -19,6 +19,19 @@ pub struct ColumnInfo {
     pub index: usize,
 }
 
+/// 列级约束（当前支持 DEFAULT / AUTOINCREMENT / NOT NULL）
+///
+/// 与 ColumnInfo 分开放，保持既有构造点/测试不受影响；按 (表, 列) 存在引擎里。
+#[derive(Debug, Clone, Default)]
+pub struct ColumnConstraints {
+    /// CREATE TABLE 里声明的 DEFAULT 值（已按列类型解析）
+    pub default_value: Option<Value>,
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT`：INSERT 省略该列时自动分配
+    pub auto_increment: bool,
+    /// 声明了 NOT NULL：显式 NULL 或省略且无 DEFAULT 时报错
+    pub not_null: bool,
+}
+
 /// 数据行
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -34,6 +47,8 @@ pub struct StorageEngine {
     schemas: HashMap<String, TableSchema>,
     /// 所有表的数据（table_name -> rows）
     data: HashMap<String, Vec<Row>>,
+    /// 列级约束：table -> column -> constraints
+    constraints: HashMap<String, HashMap<String, ColumnConstraints>>,
     /// 自增 ID 计数器
     next_id: u64,
 }
@@ -43,6 +58,7 @@ impl StorageEngine {
         StorageEngine {
             schemas: HashMap::new(),
             data: HashMap::new(),
+            constraints: HashMap::new(),
             next_id: 1,
         }
     }
@@ -54,8 +70,36 @@ impl StorageEngine {
             return Err(format!("表 '{}' 已存在", name));
         }
         self.schemas.insert(name.clone(), schema);
-        self.data.insert(name, Vec::new());
+        self.data.insert(name.clone(), Vec::new());
+        self.constraints.insert(name, HashMap::new());
         Ok(())
+    }
+
+    /// 设置某列的约束（CREATE TABLE / WAL 重放 / 快照导入时使用）
+    pub fn set_column_constraints(
+        &mut self,
+        table: &str,
+        column: &str,
+        constraints: ColumnConstraints,
+    ) -> Result<(), String> {
+        if !self.schemas.contains_key(table) {
+            return Err(format!("表 '{}' 不存在", table));
+        }
+        self.constraints
+            .entry(table.to_string())
+            .or_default()
+            .insert(column.to_string(), constraints);
+        Ok(())
+    }
+
+    /// 查询某列约束
+    pub fn column_constraints(&self, table: &str, column: &str) -> Option<&ColumnConstraints> {
+        self.constraints.get(table)?.get(column)
+    }
+
+    /// 某表全部列约束（持久化导出用）
+    pub fn constraints_for(&self, table: &str) -> Option<&HashMap<String, ColumnConstraints>> {
+        self.constraints.get(table)
     }
 
     /// 插入数据
@@ -119,6 +163,7 @@ impl StorageEngine {
         }
         self.schemas.remove(table_name);
         self.data.remove(table_name);
+        self.constraints.remove(table_name);
         Ok(())
     }
 
@@ -210,6 +255,10 @@ impl StorageEngine {
         if let Some(rows) = self.data.get_mut(table_name) {
             rows.push(row);
         }
+        // 恢复场景（快照导入 / WAL 重放）：保证后续 insert 不会复用已有 row id
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
         Ok(())
     }
 
@@ -234,6 +283,30 @@ impl StorageEngine {
                 .map(|c| format!("{}:{}", c.name, encode_type(&c.data_type)))
                 .collect();
             out.push_str(&format!("SCHEMA|{}|{}\n", name, cols.join("|")));
+
+            // 列级约束（DEFAULT / AUTOINCREMENT / NOT NULL）单独成行；旧快照没有这些行也兼容
+            if let Some(table_constraints) = self.constraints.get(&name) {
+                let mut col_names: Vec<&String> = table_constraints.keys().collect();
+                col_names.sort(); // 保证导出确定性（校验和稳定）
+                for col_name in col_names {
+                    let c = &table_constraints[col_name];
+                    if c.default_value.is_none() && !c.auto_increment && !c.not_null {
+                        continue;
+                    }
+                    let default_hex = match &c.default_value {
+                        Some(v) => hex_encode(encode_value(v).as_bytes()),
+                        None => String::new(),
+                    };
+                    out.push_str(&format!(
+                        "COLDEF|{}|{}|{}|{}|{}\n",
+                        name,
+                        col_name,
+                        if c.auto_increment { 1 } else { 0 },
+                        if c.not_null { 1 } else { 0 },
+                        default_hex
+                    ));
+                }
+            }
         }
         for name in self.table_names() {
             if let Some(rows) = self.data.get(&name) {
@@ -254,6 +327,7 @@ impl StorageEngine {
         // 清空现有状态
         self.schemas.clear();
         self.data.clear();
+        self.constraints.clear();
         self.next_id = 1;
 
         for (lineno, line) in state.lines().enumerate() {
@@ -293,6 +367,30 @@ impl StorageEngine {
                     let vals: Result<Vec<Value>, String> =
                         parts[3..].iter().map(|s| decode_value(s)).collect();
                     self.insert_row_with_id(table, id, vals?)?;
+                }
+                "COLDEF" => {
+                    if parts.len() < 6 {
+                        return Err(format!("第{}行 COLDEF 字段不足", lineno + 1));
+                    }
+                    let table = parts[1];
+                    let column = parts[2];
+                    let auto_increment = parts[3] == "1";
+                    let not_null = parts[4] == "1";
+                    let default_value = if parts[5].is_empty() {
+                        None
+                    } else {
+                        let bytes = hex_decode(parts[5])
+                            .map_err(|e| format!("第{}行 COLDEF 默认值解码失败: {}", lineno + 1, e))?;
+                        let encoded = String::from_utf8(bytes)
+                            .map_err(|_| format!("第{}行 COLDEF 默认值不是 UTF-8", lineno + 1))?;
+                        Some(decode_value(&encoded)?)
+                    };
+                    self.set_column_constraints(table, column, ColumnConstraints {
+                        default_value,
+                        auto_increment,
+                        not_null,
+                    })
+                    .map_err(|e| format!("第{}行 COLDEF: {}", lineno + 1, e))?;
                 }
                 "NEXTID" => {
                     if parts.len() < 2 {
@@ -363,6 +461,34 @@ pub(crate) fn decode_type(s: &str) -> Result<DataType, String> {
         }
         other => Err(format!("未知数据类型: {}", other)),
     }
+}
+
+/// 十六进制编码（用于把默认值等自由文本安全嵌进行协议，避免 `|`/`:` 冲突）
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// 十六进制解码
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("十六进制长度必须为偶数".to_string());
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)
+            .ok_or_else(|| format!("非法十六进制字符: {}", pair[0] as char))?;
+        let lo = (pair[1] as char).to_digit(16)
+            .ok_or_else(|| format!("非法十六进制字符: {}", pair[1] as char))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
 }
 
 /// 编码值为字符串（显式类型标记）

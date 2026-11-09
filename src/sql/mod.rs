@@ -58,6 +58,12 @@ pub enum SQLStatement {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    /// 列级约束：DEFAULT 字面量（原样，由执行器按类型解析）
+    pub default_literal: Option<String>,
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT`：省略该列时自动分配
+    pub auto_increment: bool,
+    /// 声明了 NOT NULL
+    pub not_null: bool,
 }
 
 /// JOIN 子句定义
@@ -330,7 +336,10 @@ fn parse_column_def(s: &str) -> Result<ColumnDef, String> {
         return Err(format!("列定义不完整: {}", s));
     }
     let name = parts[0].to_lowercase();
-    let type_str = parts[1..].join(" ").to_uppercase();
+    // 类型是第 2 个 token（VECTOR(3) 也不含空格）；其余是列级约束
+    let type_str = parts[1].to_uppercase();
+    let constraint_str = parts[2..].join(" ");
+    let upper_constraints = constraint_str.to_uppercase();
     // 基础类型 token（去掉 VECTOR(n) 的括号部分），用于精确匹配 DATE/TIME，
     // 避免 "DATETIME"/"TIMESTAMP" 被 "DATE"/"TIME" 前缀误吞
     let base = type_str.split('(').next().unwrap_or("").trim();
@@ -360,7 +369,47 @@ fn parse_column_def(s: &str) -> Result<ColumnDef, String> {
         return Err(format!("不支持的数据类型: {}", type_str));
     };
 
-    Ok(ColumnDef { name, data_type })
+    let auto_increment = upper_constraints.contains("AUTOINCREMENT");
+    let not_null = upper_constraints.contains("NOT NULL");
+    let default_literal = extract_default_literal(&constraint_str);
+
+    Ok(ColumnDef {
+        name,
+        data_type,
+        default_literal,
+        auto_increment,
+        not_null,
+    })
+}
+
+/// 从列约束串中提取 DEFAULT 后的一个字面量（字符串保留引号，数字/裸词原样）。
+fn extract_default_literal(constraints: &str) -> Option<String> {
+    let upper = constraints.to_uppercase();
+    let pos = upper.find("DEFAULT")?;
+    let rest = constraints[pos + "DEFAULT".len()..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let first = rest.chars().next()?;
+    if first == '\'' || first == '"' {
+        let bytes = rest.as_bytes();
+        let mut i = 1usize;
+        while i < bytes.len() {
+            if bytes[i] as char == first {
+                // SQL '' 转义：跳过成对引号
+                if first == '\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                return Some(rest[..=i].to_string());
+            }
+            i += 1;
+        }
+        // 引号未闭合：把剩余部分原样返回，交给类型解析报错
+        Some(rest.to_string())
+    } else {
+        rest.split_whitespace().next().map(|s| s.to_string())
+    }
 }
 
 /// 解析 INSERT 语句
@@ -1382,6 +1431,31 @@ mod tests {
                 assert_eq!(jc.right_col, "e.id");
             }
             _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_column_constraints() {
+        let stmts = parse_sql(
+            "CREATE TABLE t (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                name TEXT NOT NULL DEFAULT 'bob smith', \
+                tags TEXT DEFAULT '[]', \
+                score REAL DEFAULT 0.5\
+            )"
+        ).unwrap();
+        match &stmts[0] {
+            SQLStatement::CreateTable { columns, .. } => {
+                assert!(columns[0].auto_increment);
+                assert!(!columns[0].not_null);
+
+                assert!(columns[1].not_null);
+                assert_eq!(columns[1].default_literal.as_deref(), Some("'bob smith'"));
+
+                assert_eq!(columns[2].default_literal.as_deref(), Some("'[]'"));
+                assert_eq!(columns[3].default_literal.as_deref(), Some("0.5"));
+            }
+            _ => panic!("Expected CreateTable"),
         }
     }
 }

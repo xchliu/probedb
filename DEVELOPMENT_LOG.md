@@ -42,6 +42,40 @@
 - **待解决**：SelfMind 代码开发需要写权限（当前会话沙箱只能写 probedb）；
   Hermes 10/29 已追加 Phase 6 任务（docs/dsh-tasks.md），尚无代码落地。
 
+### 当日下午第二轮：P0 收口（部分列插入 + DEFAULT/AUTOINCREMENT）
+
+#### 完成
+- **DDL 列约束解析**：`DEFAULT <literal>` / `PRIMARY KEY AUTOINCREMENT` / `NOT NULL`；
+  DEFAULT 在建表时按列类型解析校验（非法值建表即报错）。
+- **部分列 INSERT**：缺列依次按 `AUTOINCREMENT`（与隐藏 row_id 对齐）→ `DEFAULT` → `NOT NULL 报错` → `NULL` 填充；
+  省略列清单时仍要求全列（SQLite 语义）。
+- **约束持久化**：
+  - 快照新增 `COLDEF|table|col|auto|notnull|<hex(default)>` 行（旧快照无此行仍兼容）
+  - WAL 新增 `C` 记录，CREATE TABLE 时逐列写入；重放时恢复约束
+  - 默认值用十六进制编码，避免 `|`/`:` 破坏行协议
+- **恢复问题修复**（写约束测试时暴露）：
+  - `open()` 在"快照不存在但 WAL 存在"时原来不重放 WAL → **首次 persist 前崩溃会丢数据**，已修复
+  - WAL 重放 INSERT 后 `next_id` 未推进 → 自增列可能复用 id，已修复
+- **SelfMind 验收脚本扩展**：部分列 INSERT / DEFAULT / AUTOINCREMENT / NULL 列 /
+  entry_history & snapshots & decay_history & operations_log 真实写法 / persist+reopen 后约束仍生效
+- **新增 [docs/selfmind-adapter-plan.md](docs/selfmind-adapter-plan.md)**：`ProbeDBConnection` 兼容层设计 + 四阶段迁移 + 回滚
+
+#### 验收（SelfMind 真实 schema）
+- `SCHEMA_SQL` 20/20 + 幂等
+- entries 部分列插入：`type=memory / source_profile=hermes / tags=[] / importance=0.5 / decay_score=0.25 / version=1 / status=active / pinned=0`
+- entry_history / snapshots / decay_history / operations_log：省略自增 id 可写入，trigger 默认值正确，NULL 列正确
+- persist → reopen → 继续部分列插入，约束仍生效
+- **结果 PASS**；剩余缺口仅 P1：`DATE()` / `GROUP BY DATE()` / `last_insert_rowid()` SQL / 事务
+
+#### 测试
+- **Rust：232 passed, 0 failed**（+3：约束解析、快照持久化、WAL 恢复）
+- **Python：22 passed, 0 failed**
+
+#### 下一步
+1. P1 SQL（DATE / GROUP BY 表达式 / last_insert_rowid / 事务）
+2. SelfMind 适配层落地（需写权限）：`ProbeDBConnection` + 606 条 entries 双读比对
+3. Hermes Phase 5 Proactive Engine 集成（同样需 SelfMind 写权限）
+
 ## 2026-11-06（周五：DSH 连续第12天零代码提交 🔴）
 
 ### 状态

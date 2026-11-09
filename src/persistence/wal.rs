@@ -154,6 +154,7 @@ impl WalLog {
             }
             let result = match parts[0] {
                 "T" => replay_create(engine, &parts),
+                "C" => replay_column_constraints(engine, &parts),
                 "I" => replay_insert(engine, &parts),
                 "D" => replay_delete(engine, &parts),
                 "U" => replay_update(engine, &parts),
@@ -220,6 +221,30 @@ fn replay_create(engine: &mut StorageEngine, parts: &[&str]) -> Result<(), Strin
         return Ok(());
     }
     engine.create_table(TableSchema { name, columns })
+}
+
+/// 重放列级约束（C 记录，幂等：重复设置无副作用）
+fn replay_column_constraints(engine: &mut StorageEngine, parts: &[&str]) -> Result<(), String> {
+    if parts.len() < 6 {
+        return Err("C 记录字段不足".to_string());
+    }
+    let table = parts[1];
+    let column = parts[2];
+    let auto_increment = parts[3] == "1";
+    let not_null = parts[4] == "1";
+    let default_value = if parts[5].is_empty() {
+        None
+    } else {
+        let bytes = storage::hex_decode(parts[5])?;
+        let encoded = String::from_utf8(bytes)
+            .map_err(|_| "C 记录默认值不是 UTF-8".to_string())?;
+        Some(storage::decode_value(&encoded)?)
+    };
+    engine.set_column_constraints(table, column, storage::ColumnConstraints {
+        default_value,
+        auto_increment,
+        not_null,
+    })
 }
 
 /// 重放 INSERT（幂等：行已存在则跳过）
@@ -368,7 +393,8 @@ mod tests {
         assert_eq!(rows.len(), 1, "DELETE后应剩1行");
         assert_eq!(rows[0].id, 1);
         assert_eq!(rows[0].values[1], Value::Text("alice2".to_string()), "UPDATE应生效");
-        assert_eq!(engine.next_id(), 1, "重放不应消耗自增ID");
+        // 重放遇到过的最大 row_id 是 2（随后被 DELETE），next_id 应越过它避免复用
+        assert_eq!(engine.next_id(), 3, "重放后自增计数器应越过历史 row id");
     }
 
     #[test]
