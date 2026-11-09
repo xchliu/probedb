@@ -76,6 +76,35 @@
 2. SelfMind 适配层落地（需写权限）：`ProbeDBConnection` + 606 条 entries 双读比对
 3. Hermes Phase 5 Proactive Engine 集成（同样需 SelfMind 写权限）
 
+### 当日下午第三轮：SelfMind 适配层原型 + 真实数据双读
+
+#### 完成
+- **`integrations/selfmind/probedb_conn.py`**：`sqlite3.Connection` 兼容层
+  （`execute/executescript/commit/rollback/close/lastrowid`、`row["col"]/row[0]/dict(row)`、
+  拦截 `SELECT last_insert_rowid()`、按 SCHEMA_SQL 回填 INTEGER/FLOAT/BOOLEAN 类型）。
+- **多列聚合投影**（后续发现需求）：`SELECT AVG(x) as a, COUNT(*) as c`（无 GROUP BY）。
+- **`tools/selfmind_dualread.py`**：同一 `UnifiedStore` 分别挂 SQLite/ProbeDB，
+  用真实数据逐行比对 `get_all_entries / get_entry / get_entries_by_type / get_stats`。
+- **`python/test_selfmind_conn.py`**：兼容层 5 个单元测试。
+
+#### 双读结果（同一 UnifiedStore 代码，零业务改动）
+| 数据集 | entries | 导入 | get_all_entries SQLite/ProbeDB | 结果 |
+|---|---:|---:|---:|:--:|
+| `selfmind.db` | 981（+180 recall） | 226ms | 15.5ms / 68.6ms | PASS |
+| `selfmind_hermes.db`（758MB） | 612 | 390ms | 46.8ms / 66.5ms | PASS |
+
+- 逐行全字段一致（浮点聚合 1e-3 容差），`get_stats` entries 派生字段一致
+- 结论：entries 表迁移到 ProbeDB 的适配路径已验证可行
+
+#### 测试
+- Rust **232 passed**（多列聚合加入现有聚合测试）
+- Python **27 passed**（+5 兼容层测试）
+
+#### 仍未覆盖
+- P1：`DATE()` / `GROUP BY DATE()`（趋势接口）、事务
+- 历史/快照/日志表继续留 SQLite（按评估）
+- 适配层代码尚未复制进 SelfMind 仓库（无写权限）
+
 ## 2026-11-06（周五：DSH 连续第12天零代码提交 🔴）
 
 ### 状态

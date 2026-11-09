@@ -120,3 +120,35 @@ class ProbeDBConnection:
 2. entries 双读比对 100% 一致（606 条）；
 3. `cargo test`（ProbeDB）与 `pytest`（SelfMind）全绿；
 4. 关闭 backend 开关可即时回滚 SQLite。
+
+## 八、原型验证结果（2026-11-09）
+
+适配层原型已在本仓库实现并跑通，等 SelfMind 写权限后可直接复制落地：
+
+| 文件 | 作用 |
+|---|---|
+| `integrations/selfmind/probedb_conn.py` | `ProbeDBConnection` / `ProbeDBCursor` / `Row`（sqlite3 兼容） |
+| `tools/selfmind_dualread.py` | 同一 `UnifiedStore` 分别挂 SQLite / ProbeDB，逐行比对 |
+| `python/test_selfmind_conn.py` | 兼容层单测（Row/类型回填/NULL/last_insert_rowid/commit） |
+
+### 双读实测（同一 `UnifiedStore` 代码）
+
+| 数据集 | entries | 导入耗时 | get_all_entries（SQLite / ProbeDB） | 结果 |
+|---|---:|---:|---:|:--:|
+| `data/selfmind.db` | 981（+180 recall） | 226 ms | 15.5 ms / 68.6 ms | PASS |
+| `data/selfmind_hermes.db`（758MB） | 612 | 390 ms | 46.8 ms / 66.5 ms | PASS |
+
+比对项：`get_all_entries` 逐行全字段、`get_entry` 抽样、`get_entries_by_type`、`get_stats`
+（entries 派生字段）——**全部一致**（浮点聚合允许 1e-3 容差）。
+
+### 过程中补齐的 ProbeDB 能力
+
+- 多列聚合投影（`SELECT AVG(x) as a, COUNT(*) as c`，SelfMind health/trend 接口需要）
+- 兼容层按 SCHEMA_SQL 回填 INTEGER/FLOAT/BOOLEAN 类型，COUNT/AVG 聚合列回填数字类型
+- `SELECT last_insert_rowid()` 由兼容层拦截
+
+### 仍未覆盖（P1）
+
+- `DATE(timestamp)` / `GROUP BY DATE(timestamp)`：`get_overall_decay_trend` 等趋势接口需要
+- 事务 `BEGIN/COMMIT`（当前 SelfMind 未使用）
+- 全量历史/快照/日志表（按评估继续留 SQLite）

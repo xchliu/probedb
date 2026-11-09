@@ -9,9 +9,10 @@ AI 原生嵌入式数据库。Rust 实现，**零外部依赖**（没有任何�
 | 项目 | 状态 |
 |---|---|
 | Rust 核心 | 约 9k 行，零第三方依赖 |
-| 测试 | **232 个 Rust 测试 + 22 个 Python 测试，全绿**（性能断言需 `PROBEDB_PERF_STRICT=1` 才严格失败） |
+| 测试 | **232 个 Rust 测试 + 27 个 Python 测试，全绿**（性能断言需 `PROBEDB_PERF_STRICT=1` 才严格失败） |
 | Hermes 接入验证 | ✅ 已导入真实 `~/.hermes/memories`（46 条）并完成跨进程检索 |
-| SelfMind 兼容验收 | ✅ [tools/selfmind_compat.py](tools/selfmind_compat.py) PASS（schema 初始化 / 别名 JOIN / 参数化查询） |
+| SelfMind 兼容验收 | ✅ [tools/selfmind_compat.py](tools/selfmind_compat.py) PASS（schema/约束/历史表写入）|
+| SelfMind 双读比对 | ✅ [tools/selfmind_dualread.py](tools/selfmind_dualread.py) PASS（真实 612 条 entries，SQLite vs ProbeDB 逐行一致） |
 | 候选评估 | [Hermes](docs/hermes-integration.md) · [SelfMind 迁移评估](docs/selfmind-migration-assessment.md) |
 | 版本 | v0.1.0（嵌入式，单进程） |
 
@@ -52,6 +53,7 @@ python3 tools/bench_probedb.py --sizes 100,1000,5000,10000
 - **SQL 子集**：`CREATE TABLE [IF NOT EXISTS]`、`INSERT`（列清单可任意顺序、可省略列清单，支持部分列 + `DEFAULT` / `AUTOINCREMENT` / `NOT NULL`）、`SELECT`（`WHERE`、`LIKE`、`IN / NOT IN`、`IS NULL / IS NOT NULL`、`ORDER BY` 多列、`LIMIT/OFFSET`、`DISTINCT`、`GROUP BY` + `HAVING`、`SUM/AVG/MIN/MAX`、`COUNT(DISTINCT col)`、`INNER JOIN` + **表别名**、**聚合列别名**）、`UPDATE`（支持 `col=col+1`）、`DELETE`、`DROP TABLE`、`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`（兼容层：校验后接受，暂不建物理索引）
 - **列约束**：`DEFAULT` / `AUTOINCREMENT` / `NOT NULL` 会随快照与 WAL 一起持久化、重启后继续生效；省略的自增列自动分配并与隐藏 row_id 对齐
 - **NULL 语义**：支持写入/查询 `NULL`（`IS NULL` / `IS NOT NULL`），NULL 结果以 `"NULL"` 返回（行值协议尚未类型化）
+- **聚合**：单列/多列聚合、`COUNT(DISTINCT col)`、`GROUP BY` 聚合、聚合列别名
 - **SQL 兼容细节**：`--` 行注释、`''` 转义、字符串内分号/括号、`IF NOT EXISTS` 幂等、表级约束子句跳过；WHERE 操作符两侧可有/无空格
 - **参数化 API**（Python）：`db.execute(sql, params=(...))`、`execute_all`、`executescript`、`commit`、`last_row_id`、`Result.records`；`None` → SQL NULL
 - **类型**：`INTEGER`、`FLOAT`、`TEXT`、`BOOLEAN`、`DATE`、`TIME`、`VECTOR(n)`（向量是一等公民）
@@ -74,13 +76,18 @@ src/
 python/
   probedb.py        # 唯一的 Python 绑定（ctypes，结构化 Result）
   test_probedb.py   # Python 单元测试
+  test_selfmind_conn.py # sqlite3 兼容层测试
+integrations/selfmind/
+  probedb_conn.py   # sqlite3.Connection 兼容层（SelfMind 适配原型）
 tools/
   probedb_mem.py    # Hermes 记忆独立存储工具（导入/检索/增删改/统计）
   bench_probedb.py  # 记忆场景基准测试（导入/检索/CLI 延迟）
-  selfmind_compat.py # SelfMind Phase 5.5 兼容验收（schema/别名/参数化）
+  selfmind_compat.py # SelfMind Phase 5.5 兼容验收（schema/别名/参数化/约束）
+  selfmind_dualread.py # SelfMind SQLite vs ProbeDB 双读比对
 docs/
   hermes-integration.md            # Hermes 候选评估：实测数据、接入方案、风险
   selfmind-migration-assessment.md # SelfMind 迁移评估：验收结果、缺口、758MB 规模分析
+  selfmind-adapter-plan.md         # ProbeDBConnection 适配层设计 + 分阶段迁移
 ```
 
 ## 当前限制（明确边界）
@@ -96,7 +103,7 @@ docs/
 ## 路线图
 
 1. **SelfMind 迁移前置** ✅：4 条验收标准 PASS；SQL 兼容缺口全部补齐（NULL / IN / 别名 / 表达式 UPDATE / DEFAULT+AUTOINCREMENT / 部分列插入）。
-2. **SelfMind 适配层**（进行中）：[适配方案](docs/selfmind-adapter-plan.md)；需要 SelfMind 写权限后落地 `ProbeDBStore`，用真实 606 条 entries 做双读比对。
+2. **SelfMind 适配层**（进行中）：兼容层原型 + 双读比对已完成（612 条 entries 全部一致）；[方案](docs/selfmind-adapter-plan.md)；需要 SelfMind 写权限后把 `probedb_conn.py` 落地到 SelfMind 仓库。
 3. **Hermes 记忆接入**：独立 CLI/工具已跑通，下一步在 Hermes 侧挂载为记忆读写通道。
 4. **协议升级**：类型化行值 + C 层参数绑定（当前参数绑定在 Python 客户端完成）。
 5. **存储升级**：索引、事务、增量快照；再评估替换内部存储。

@@ -443,103 +443,21 @@ impl Executor {
                 let parsed_cols: Vec<(String, Option<String>)> = columns.iter()
                     .map(|c| split_column_alias(c))
                     .collect();
-                let upper_cols: Vec<String> = parsed_cols.iter()
-                    .map(|(expr, _)| expr.trim().to_uppercase()).collect();
-
-                // 单列聚合：COUNT(*) / COUNT(DISTINCT col) / SUM / AVG / MIN / MAX
-                if parsed_cols.len() == 1 {
-                    let (expr, alias) = &parsed_cols[0];
-                    let expr_trimmed = expr.trim();
-                    let upper = expr_trimmed.to_uppercase();
-
-                    // COUNT(*)
-                    if upper == "COUNT(*)" || upper == "COUNT (*)" {
-                        let label = alias.clone().unwrap_or_else(|| "count".to_string());
-                        let count = scored_rows.len();
-                        return Ok(ExecuteResult::SelectResult {
-                            columns: vec![label],
-                            rows: vec![vec![count.to_string()]],
-                        });
+                // 聚合投影：单列和多列聚合都支持（如 SELECT AVG(x) as a, COUNT(*) as c）
+                let all_aggregates = !parsed_cols.is_empty()
+                    && parsed_cols.iter().all(|(expr, _)| is_aggregate_expression(expr));
+                if all_aggregates {
+                    let mut out_columns = Vec::with_capacity(parsed_cols.len());
+                    let mut out_values = Vec::with_capacity(parsed_cols.len());
+                    for (expr, alias) in &parsed_cols {
+                        let (default_label, value) = eval_aggregate_expression(expr, &scored_rows, schema)?;
+                        out_columns.push(alias.clone().unwrap_or(default_label));
+                        out_values.push(value);
                     }
-
-                    // COUNT(DISTINCT col)
-                    if upper.starts_with("COUNT(DISTINCT ") && upper.ends_with(')') {
-                        let inner = if let (Some(lp), Some(rp)) = (expr_trimmed.find('('), expr_trimmed.rfind(')')) {
-                            expr_trimmed[lp + 1..rp].trim()
-                        } else {
-                            ""
-                        };
-                        let col_name = inner
-                            .strip_prefix("DISTINCT")
-                            .or_else(|| inner.strip_prefix("distinct"))
-                            .unwrap_or(inner)
-                            .trim()
-                            .to_lowercase();
-                        let ci = schema.columns.iter().find(|c| c.name == col_name)
-                            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
-                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        for (row, _) in &scored_rows {
-                            if let Some(v) = row.values.get(ci.index) {
-                                if !matches!(v, Value::Null) {
-                                    seen.insert(v.to_string());
-                                }
-                            }
-                        }
-                        let label = alias.clone().unwrap_or_else(|| "count".to_string());
-                        return Ok(ExecuteResult::SelectResult {
-                            columns: vec![label],
-                            rows: vec![vec![seen.len().to_string()]],
-                        });
-                    }
-
-                    // SUM/AVG/MIN/MAX 聚合（单列）
-                    if let Some(agg_fn) = parse_aggregate(&upper) {
-                        let inner_col = extract_agg_column(&upper);
-                        let col_name = inner_col.trim().to_lowercase();
-                        let ci = schema.columns.iter().find(|c| c.name == col_name)
-                            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
-
-                        let mut nums: Vec<f64> = Vec::new();
-                        for (row, _) in &scored_rows {
-                            if let Some(v) = row.values.get(ci.index) {
-                                match v {
-                                    Value::Integer(n) => nums.push(*n as f64),
-                                    Value::Float(f) => nums.push(*f),
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        let (agg_name, agg_value) = match agg_fn {
-                            AggFunc::Sum => ("sum", nums.iter().sum::<f64>()),
-                            AggFunc::Avg => {
-                                if nums.is_empty() { ("avg", 0.0) }
-                                else { ("avg", nums.iter().sum::<f64>() / nums.len() as f64) }
-                            }
-                            AggFunc::Min => {
-                                if nums.is_empty() { ("min", 0.0) }
-                                else { ("min", nums.iter().cloned().fold(f64::INFINITY, f64::min)) }
-                            }
-                            AggFunc::Max => {
-                                if nums.is_empty() { ("max", 0.0) }
-                                else { ("max", nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) }
-                            }
-                        };
-
-                        let value_str = if agg_value == agg_value.trunc()
-                            && ci.data_type == DataType::Integer && agg_fn != AggFunc::Avg
-                        {
-                            format!("{}", agg_value as i64)
-                        } else {
-                            format!("{}", agg_value)
-                        };
-
-                        let label = alias.clone().unwrap_or_else(|| agg_name.to_string());
-                        return Ok(ExecuteResult::SelectResult {
-                            columns: vec![label],
-                            rows: vec![vec![value_str]],
-                        });
-                    }
+                    return Ok(ExecuteResult::SelectResult {
+                        columns: out_columns,
+                        rows: vec![out_values],
+                    });
                 }
 
                 // 解析列投影（* 或具体列名）
@@ -645,7 +563,7 @@ impl Executor {
 // ===== 聚合函数支持 =====
 
 /// 聚合函数类型
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Copy)]
 enum AggFunc {
     Sum,
     Avg,
@@ -680,6 +598,102 @@ fn extract_agg_column(s: &str) -> &str {
         }
     }
     s
+}
+
+/// 判断 SELECT 表达式是否是聚合函数（COUNT(*) / COUNT(DISTINCT col) / SUM/AVG/MIN/MAX）
+fn is_aggregate_expression(expr: &str) -> bool {
+    let upper = expr.trim().to_uppercase();
+    upper == "COUNT(*)"
+        || upper == "COUNT (*)"
+        || (upper.starts_with("COUNT(DISTINCT ") && upper.ends_with(')'))
+        || parse_aggregate(&upper).is_some()
+}
+
+/// 计算单个聚合表达式，返回 (默认列名, 值字符串)
+fn eval_aggregate_expression(
+    expr: &str,
+    rows: &[(Row, Option<f64>)],
+    schema: &TableSchema,
+) -> Result<(String, String), String> {
+    let expr_trimmed = expr.trim();
+    let upper = expr_trimmed.to_uppercase();
+
+    // COUNT(*)
+    if upper == "COUNT(*)" || upper == "COUNT (*)" {
+        return Ok(("count".to_string(), rows.len().to_string()));
+    }
+
+    // COUNT(DISTINCT col)
+    if upper.starts_with("COUNT(DISTINCT ") && upper.ends_with(')') {
+        let inner = if let (Some(lp), Some(rp)) = (expr_trimmed.find('('), expr_trimmed.rfind(')')) {
+            expr_trimmed[lp + 1..rp].trim()
+        } else {
+            ""
+        };
+        let col_name = inner
+            .strip_prefix("DISTINCT")
+            .or_else(|| inner.strip_prefix("distinct"))
+            .unwrap_or(inner)
+            .trim()
+            .to_lowercase();
+        let ci = schema.columns.iter().find(|c| c.name == col_name)
+            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (row, _) in rows {
+            if let Some(v) = row.values.get(ci.index) {
+                if !matches!(v, Value::Null) {
+                    seen.insert(v.to_string());
+                }
+            }
+        }
+        return Ok(("count".to_string(), seen.len().to_string()));
+    }
+
+    // SUM / AVG / MIN / MAX
+    if let Some(agg_fn) = parse_aggregate(&upper) {
+        let inner_col = extract_agg_column(&upper);
+        let col_name = inner_col.trim().to_lowercase();
+        let ci = schema.columns.iter().find(|c| c.name == col_name)
+            .ok_or_else(|| format!("列 '{}' 不存在", col_name))?;
+
+        let mut nums: Vec<f64> = Vec::new();
+        for (row, _) in rows {
+            if let Some(v) = row.values.get(ci.index) {
+                match v {
+                    Value::Integer(n) => nums.push(*n as f64),
+                    Value::Float(f) => nums.push(*f),
+                    _ => {}
+                }
+            }
+        }
+
+        let (agg_name, agg_value) = match agg_fn {
+            AggFunc::Sum => ("sum", nums.iter().sum::<f64>()),
+            AggFunc::Avg => {
+                if nums.is_empty() { ("avg", 0.0) }
+                else { ("avg", nums.iter().sum::<f64>() / nums.len() as f64) }
+            }
+            AggFunc::Min => {
+                if nums.is_empty() { ("min", 0.0) }
+                else { ("min", nums.iter().cloned().fold(f64::INFINITY, f64::min)) }
+            }
+            AggFunc::Max => {
+                if nums.is_empty() { ("max", 0.0) }
+                else { ("max", nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) }
+            }
+        };
+
+        let value_str = if agg_value == agg_value.trunc()
+            && ci.data_type == DataType::Integer && agg_fn != AggFunc::Avg
+        {
+            format!("{}", agg_value as i64)
+        } else {
+            format!("{}", agg_value)
+        };
+        return Ok((agg_name.to_string(), value_str));
+    }
+
+    Err(format!("不支持的聚合表达式: {}", expr))
 }
 
 /// GROUP BY 分组聚合执行
@@ -4293,6 +4307,20 @@ mod tests {
             ExecuteResult::SelectResult { columns, rows } => {
                 assert_eq!(columns, &vec!["n".to_string()]);
                 assert_eq!(rows, &vec![vec!["2".to_string()]]);
+            }
+            _ => panic!("Expected SelectResult"),
+        }
+
+        // 多列聚合无 GROUP BY（SelfMind health/trend 接口的写法）
+        let r = executor.execute(parse_sql(
+            "SELECT AVG(score) as avg_score, COUNT(*) as cnt FROM t"
+        ).unwrap()).unwrap();
+        match &r[0] {
+            ExecuteResult::SelectResult { columns, rows } => {
+                assert_eq!(columns, &vec!["avg_score".to_string(), "cnt".to_string()]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], "3");
+                assert_eq!(rows[0][1], "3");
             }
             _ => panic!("Expected SelectResult"),
         }
