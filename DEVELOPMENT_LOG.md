@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-11-10（周二：DSH 登录态过期 🔴）
+
+### 状态
+- **Rust**: 231 passed, 1 failed ⚠️（`test_persistence_perf_baseline`：batch 40.3ms > sync 32.0ms×1.2，环境负载波动）
+- **Python**: 22 passed, 0 failed ✅（base test_probedb.py）
+- **今日新提交**: 无
+- **Repo**: 干净，无未提交变更
+
+### 监督观察
+- 🔴 **DSH headless 不可用**：`ACCOUNT_SIGN_IN_REQUIRED` — 桌面 App 登录态过期。
+  昨天（11/09）DSH 四轮连爆产出 232 全绿后，今天完全无法连接。
+- 本周计划（11/09-11/13）无每日任务分解，昨天全部收口后无新任务分配。
+- 剩余项（均需坦哥方向或外部权限）：
+  - P1 SQL：DATE() / GROUP BY DATE() / last_insert_rowid() / 事务
+  - SelfMind 适配层代码落地（需 SelfMind repo 写权限）
+  - Hermes Phase 5/6 集成
+- ⚠️ DSH 登录态需坦哥在桌面端重新登录
+
+### 下一步
+- DSH 恢复前无法推进开发
+- 待坦哥：① 重登 DSH 桌面 App ② 确认本周剩余任务方向
+
+---
+
 ## 2026-11-09（周一：DSH 连续第14天零代码提交 🔴 新一周开始）
 
 ### 状态
